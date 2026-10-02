@@ -105,7 +105,8 @@ static void logf(const wchar_t* fmt, ...) {
 struct Config {
     std::wstring hotkey, game, audio, folder;
     int seconds, height, fps;  // height 0 = auto
-    bool crop;
+    int bitrate, audiokbps;    // video kbps while recording, 0 = auto from maxmb
+    bool crop, mono;
     double maxmb, gamevol, micvol, discordvol;
 } cfg;
 
@@ -135,6 +136,12 @@ static const char kDefaultIni[] =
     "crop=0\r\n"
     "; Hard file size cap in MB. Clips are compressed on save to land just under it.\r\n"
     "maxmb=19\r\n"
+    "; Video bitrate in kbps while recording. 0 = auto (as much as maxmb allows for the clip length).\r\n"
+    "; With a fixed bitrate, clips under maxmb save instantly as recorded; bigger ones are re-compressed to fit.\r\n"
+    "bitrate=0\r\n"
+    "; AAC audio bitrate: 96, 128, 160 or 192 kbps. mono=1 folds the mix to one channel.\r\n"
+    "audiokbps=128\r\n"
+    "mono=0\r\n"
     "; Clip folder (empty = Videos\\Clips)\r\n"
     "folder=\r\n";
 
@@ -165,6 +172,10 @@ static void loadConfig() {
     cfg.crop = num(L"crop", 0) != 0;
     cfg.fps = std::clamp((int)num(L"fps", 60), 10, 120);
     cfg.maxmb = std::clamp(num(L"maxmb", 19), 1.0, 4000.0);
+    int br = (int)num(L"bitrate", 0);
+    cfg.bitrate = br <= 0 ? 0 : std::clamp(br, 1000, 100000);
+    cfg.audiokbps = std::clamp((int)std::lround(num(L"audiokbps", 128) / 32) * 32, 96, 192);  // the AAC encoder's rates
+    cfg.mono = num(L"mono", 0) != 0;
     cfg.gamevol = num(L"gamevol", 1);
     cfg.micvol = num(L"micvol", 1);
     cfg.discordvol = num(L"discordvol", 1);
@@ -181,9 +192,41 @@ static void loadConfig() {
 static bool hasAudio(const wchar_t* src) { return cfg.audio.find(src) != std::wstring::npos; }
 static bool anyAudio() { return hasAudio(L"game") || hasAudio(L"desktop") || hasAudio(L"mic") || hasAudio(L"discord"); }
 
-// video bitrate from the size cap: 5% headroom for container + rate-control wobble, 128k for AAC
-static UINT32 videoBitrate(double seconds, double maxmb, bool audio) {
-    return (UINT32)std::max(300000.0, maxmb * 1e6 * 8 * 0.95 / seconds - (audio ? 128000 : 0));
+// video bitrate from the size cap: 5% headroom for container + rate-control wobble, minus the audio track
+static UINT32 videoBitrate(double seconds, double maxmb, UINT32 audioBps) {
+    return (UINT32)std::max(300000.0, maxmb * 1e6 * 8 * 0.95 / seconds - audioBps);
+}
+
+// largest standard height with >= 3.6 bits per pixel per second (clean-looking H.264 for fast games).
+// Frame rate is deliberately ignored: the bitrate is what the file size buys.
+static UINT pickHeight(UINT32 budget, UINT bufW, UINT bufH) {
+    const UINT heights[] = {1440, 1080, 900, 720, 540, 480, 360};
+    UINT pick = 360;
+    for (UINT h : heights) {
+        if (h > bufH) continue;
+        double w = (double)h * bufW / bufH;
+        if (budget / (w * h) >= 3.6) return h;
+        pick = h;
+    }
+    return std::min(pick, bufH);
+}
+
+// What a clip will come out as, for the settings window. Auto bitrate: always ~maxmb. Fixed bitrate: the CBR
+// buffer's size, plus how long a clip can be and still save as-is under the cap.
+struct Estimate {
+    double mb, secsFit;
+    UINT32 vbps;
+    UINT h;
+};
+static Estimate estimate(int secs, double maxmb, int bitrateKbps, UINT32 audioBps, int height, UINT srcW, UINT srcH) {
+    Estimate e{maxmb, 0, videoBitrate(secs, maxmb, audioBps), 0};
+    if (bitrateKbps) {
+        e.vbps = bitrateKbps * 1000;
+        e.mb = (e.vbps + audioBps) * secs / 8e6 * 1.01;  // ~1% MP4 overhead
+        e.secsFit = maxmb * 8e6 * 0.95 / (e.vbps + audioBps);
+    }
+    e.h = height ? std::min<UINT>(height, srcH) : pickHeight(e.vbps, srcW, srcH);
+    return e;
 }
 
 static const struct { const wchar_t* name; UINT vk; } keyNames[] = {
@@ -380,12 +423,14 @@ static bool videoLoop(HMONITOR mon, HWND win) {
     RECT cap{0, 0, monRc.right - monRc.left, monRc.bottom - monRc.top};
     captureRect(win, monRc, cap);
     const UINT srcW = cap.right - cap.left, srcH = cap.bottom - cap.top;
-    // buffer resolution: the fixed choice, or 1080p for auto (the save step picks the final size)
-    UINT outH = std::min<UINT>(cfg.height ? cfg.height : 1080, srcH) & ~1u;
+    // auto bitrate: buffer at 2x the size cap's average bitrate so the save step re-encodes from a clean source.
+    // fixed bitrate: the buffer is the clip.
+    UINT32 abps = anyAudio() ? cfg.audiokbps * 1000 : 0;
+    UINT32 vbr = cfg.bitrate ? cfg.bitrate * 1000 : (UINT32)std::clamp(2.0 * videoBitrate(cfg.seconds, cfg.maxmb, abps), 4e6, 60e6);
+    // buffer resolution: the fixed choice; auto = 1080p (the save step picks the final size), or what a fixed bitrate suits
+    UINT outH = std::min<UINT>(cfg.height ? cfg.height : cfg.bitrate ? pickHeight(vbr, srcW, srcH) : 1080, srcH) & ~1u;
     UINT outW = (UINT)((UINT64)outH * srcW / srcH + 1) & ~1u;
     const UINT fps = cfg.fps;
-    // buffer at 2x the size cap's average bitrate: calm clips save as-is, busy ones re-encode from a clean source
-    UINT32 vbr = (UINT32)std::clamp(2.0 * videoBitrate(cfg.seconds, cfg.maxmb, anyAudio()), 4e6, 60e6);
     logf(L"%ls: %ux%u, capturing %ux%u at (%ld,%ld) -> %ux%u @%u, buffer %u kbps", ad.Description, dd.ModeDesc.Width,
          dd.ModeDesc.Height, srcW, srcH, cap.left, cap.top, outW, outH, fps, vbr / 1000);
 
@@ -742,20 +787,21 @@ static bool captureLoop(int si, DWORD pid) {
 static bool audioLoop() {
     ComPtr<IMFTransform> enc;
     CHECK(CoCreateInstance(CLSID_AACMFTEncoder, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&enc)));
-    auto audioType = [](const GUID& sub) {
+    const UINT32 ch = cfg.mono ? 1 : 2;
+    auto audioType = [&](const GUID& sub) {
         ComPtr<IMFMediaType> t;
         MFCreateMediaType(&t);
         t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
         t->SetGUID(MF_MT_SUBTYPE, sub);
         t->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
         t->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, SR);
-        t->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        t->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, ch);
         return t;
     };
     ComPtr<IMFMediaType> in = audioType(MFAudioFormat_PCM), out = audioType(MFAudioFormat_AAC);
-    in->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
-    in->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, SR * 4);
-    out->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16000);  // 128 kbps
+    in->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 2 * ch);
+    in->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, SR * 2 * ch);
+    out->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, cfg.audiokbps * 125);
     CHECK(enc->SetInputType(0, in.Get(), 0));
     CHECK(enc->SetOutputType(0, out.Get(), 0));
     {
@@ -778,18 +824,20 @@ static bool audioLoop() {
             if (target <= mixPos) continue;
             from = mixPos;
             n = (UINT32)(target - mixPos);
-            CHECK(MFCreateMemoryBuffer(n * 4, &b));
+            CHECK(MFCreateMemoryBuffer(n * 2 * ch, &b));
             BYTE* raw;
             b->Lock(&raw, nullptr, nullptr);
             int16_t* o = (int16_t*)raw;
-            for (UINT32 i = 0; i < n * 2; i++) {
-                size_t idx = (size_t)((from + i / 2) % RING) * 2 + i % 2;
+            for (UINT32 i = 0; i < n * ch; i++) {
                 int sum = 0;
-                for (auto& s : aSrc) { sum += s.ring[idx]; s.ring[idx] = 0; }
-                o[i] = (int16_t)std::clamp(sum, -32768, 32767);
+                for (UINT32 c = 0; c < 3 - ch; c++) {  // mono: average both ring channels into one
+                    size_t idx = (size_t)((from + i / ch) % RING) * 2 + (ch == 2 ? i % 2 : c);
+                    for (auto& s : aSrc) { sum += s.ring[idx]; s.ring[idx] = 0; }
+                }
+                o[i] = (int16_t)std::clamp(sum / (int)(3 - ch), -32768, 32767);
             }
             b->Unlock();
-            b->SetCurrentLength(n * 4);
+            b->SetCurrentLength(n * 2 * ch);
             mixPos = target;
         }
         ComPtr<IMFSample> s;
@@ -964,20 +1012,6 @@ static bool transcode(const std::wstring& src, const std::wstring& dst, UINT w, 
     return true;
 }
 
-// largest standard height with >= 3.6 bits per pixel per second (clean-looking H.264 for fast games).
-// Frame rate is deliberately ignored: the bitrate is what the file size buys.
-static UINT pickHeight(UINT32 budget, UINT bufW, UINT bufH) {
-    const UINT heights[] = {1440, 1080, 900, 720, 540, 480, 360};
-    UINT pick = 360;
-    for (UINT h : heights) {
-        if (h > bufH) continue;
-        double w = (double)h * bufW / bufH;
-        if (budget / (w * h) >= 3.6) return h;
-        pick = h;
-    }
-    return std::min(pick, bufH);
-}
-
 // Work back from the cap: aim for 98.5% of it and rescale the bitrate by each miss (size ~ bitrate), up or down.
 // Keeps the largest encode that fits; stops once within 3% of the cap. Returns the size written to dst, 0 if none fit.
 static ULONGLONG fitToSize(const std::wstring& src, const std::wstring& tmp, const std::wstring& dst, UINT w, UINT h,
@@ -1015,7 +1049,7 @@ static void fail(const std::wstring& title, const std::wstring& text) {
 }
 
 static void compressAndSave(std::vector<Packet> v, size_t s, std::vector<Packet> a, ComPtr<IMFMediaType> vt,
-                            ComPtr<IMFMediaType> at, std::wstring path, double maxmb) {
+                            ComPtr<IMFMediaType> at, std::wstring path, double maxmb, bool keepIfFits) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     wchar_t tmpDir[MAX_PATH];
     GetTempPathW(MAX_PATH, tmpDir);
@@ -1028,15 +1062,19 @@ static void compressAndSave(std::vector<Packet> v, size_t s, std::vector<Packet>
         double secs = (v.back().t + v.back().dur - v[s].t) / 1e7;
         size = fileSize(src);
         logf(L"saving %.1fs clip, buffer %ux%u %.1f MB", secs, bufW, bufH, size / 1e6);
-        // always re-encode to fill the cap; a calm clip that already fits keeps the full buffer resolution
         bool fits = size <= limit;
         size = 0;
-        UINT32 budget = videoBitrate(secs, maxmb, at != nullptr);
-        outH = cfg.height || fits ? bufH : pickHeight(budget, bufW, bufH);
+        if (keepIfFits && fits) {  // fixed bitrate and under the cap: the buffer is the clip
+            outH = bufH;
+            if (MoveFileExW(src.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) size = fileSize(path);
+        }
+        // auto bitrate always re-encodes to fill the cap; a calm clip that already fits keeps the full buffer resolution
+        UINT32 budget = videoBitrate(secs, maxmb, at ? MFGetAttributeUINT32(at.Get(), MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16000) * 8 : 0);
+        outH = size ? outH : cfg.height || fits ? bufH : pickHeight(budget, bufW, bufH);
         ComPtr<ID3D11Device> dev;
         ComPtr<IMFDXGIDeviceManager> mgr;
         UINT token;
-        if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        if (!size && SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                                         nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, nullptr)) &&
             SUCCEEDED(MFCreateDXGIDeviceManager(&token, &mgr)) && SUCCEEDED(mgr->ResetDevice(dev.Get(), token))) {
             ComPtr<ID3D11Multithread> mt;
@@ -1097,7 +1135,8 @@ static void saveClip() {
     MessageBeep(MB_OK);  // "got it" — the moment is captured; compression continues in the background
     saving = true;
     if (saveThread.joinable()) saveThread.join();
-    saveThread = std::thread(compressAndSave, std::move(v), s, std::move(a), vt, at, cfg.folder + L"\\" + name + file, cfg.maxmb);
+    saveThread = std::thread(compressAndSave, std::move(v), s, std::move(a), vt, at, cfg.folder + L"\\" + name + file, cfg.maxmb,
+                             cfg.bitrate != 0);
     PostMessageW(ui, STATUS_MSG, 0, 0);
 }
 
@@ -1789,9 +1828,14 @@ static int selftest() {
     std::vector<BYTE> want = {0, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x68, 0xBB};
     assert(seqHeader(au) == want);
     // 30s at 19MB with audio on a 32:9 buffer -> 540p; 16:9 -> 720p; tiny budget floors at 360p
-    UINT32 b = videoBitrate(30, 19, true);
+    UINT32 b = videoBitrate(30, 19, 128000);
     assert(pickHeight(b, 3840, 1080) == 540 && pickHeight(b, 1920, 1080) == 720);
     assert(pickHeight(300000, 1920, 1080) == 360 && pickHeight(b, 1280, 720) == 720);
+    // estimates: auto squeezes to the cap; 8 Mbps + 128k audio for 20s is ~20.5 MB and 17s fits 19 MB
+    Estimate e = estimate(30, 19, 0, 128000, 0, 1920, 1080);
+    assert(e.mb == 19 && e.vbps == b && e.h == 720);
+    e = estimate(20, 19, 8000, 128000, 0, 1920, 1080);
+    assert(e.mb > 20.4 && e.mb < 20.7 && (int)e.secsFit == 17 && e.h == 1080);
     // no game window: whole monitor, or its centre 16:9 with crop on (monitor at a non-zero desktop origin)
     RECT mon{-5120, 0, 0, 1440}, r{};
     cfg.crop = false;

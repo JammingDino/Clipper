@@ -43,6 +43,9 @@ On first run a commented `clipper.ini` is written next to the exe. Edit it throu
 | `fps` | `60` | Frame rate |
 | `crop` | `0` | `1` = crop ultrawide to centre 16:9 |
 | `maxmb` | `19` | Hard file size cap in MB |
+| `bitrate` | `0` | Video kbps while recording. `0` = auto from `maxmb`; a fixed rate saves clips under the cap instantly |
+| `audiokbps` | `128` | AAC bitrate: `96`, `128`, `160` or `192` |
+| `mono` | `0` | `1` = mix audio down to one channel |
 | `folder` | *(empty)* | Clip folder, empty = `Videos\Clips` |
 
 ## License
