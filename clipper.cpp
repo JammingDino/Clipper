@@ -56,6 +56,14 @@
 
 using Microsoft::WRL::ComPtr;
 
+// Set by the release build (build.bat passes VERSION from the git tag); local builds show "dev".
+#ifndef CLIPPER_VERSION
+#define CLIPPER_VERSION dev
+#endif
+#define WSTR2(x) L## #x
+#define WSTR(x) WSTR2(x)
+#define CLIPPER_VERSION_W WSTR(CLIPPER_VERSION)
+
 // ---------- misc ----------
 static std::wstring exeDir() {
     wchar_t p[MAX_PATH];
@@ -1204,7 +1212,7 @@ static std::vector<std::wstring> windowedApps() {
 enum {
     ID_STATUS = 100, ID_SAVECLIP, ID_OPENFOLDER, ID_GAME, ID_REFRESH, ID_HINT, ID_HOTKEY,
     ID_A_GAME, ID_A_DISCORD, ID_A_MIC, ID_A_DESKTOP, ID_V_GAME, ID_V_DISCORD, ID_V_MIC,
-    ID_SECONDS, ID_SECONDS_UD, ID_HEIGHT, ID_FPS, ID_CROP, ID_MAXMB, ID_BITRATE, ID_FOLDER, ID_BROWSE, ID_SAVED
+    ID_SECONDS, ID_SECONDS_UD, ID_HEIGHT, ID_FPS, ID_CROP, ID_MAXMB, ID_FOLDER, ID_BROWSE, ID_SAVED
 };
 enum { TIMER_WATCH = 1, TIMER_APPLY = 2 };
 static HFONT uiFont, uiBold;
@@ -1265,13 +1273,12 @@ static void buildUi() {
     ctl(L"BUTTON", L"Crop ultrawide to 16:9 (centre)", BS_AUTOCHECKBOX | WS_TABSTOP, X, 410, W, 22, ID_CROP);
     ctl(L"STATIC", L"Max file size", 0, L, 442, 110, 20, 0);
     ctl(L"EDIT", L"", WS_BORDER | WS_TABSTOP, X, 439, 60, 23, ID_MAXMB);
-    ctl(L"STATIC", L"MB   (Discord: 10 free, 500 Nitro)", 0, X + 68, 442, 250, 20, 0);
-    ctl(L"STATIC", L"", 0, X, 466, W, 18, ID_BITRATE);
-    ctl(L"STATIC", L"Save to", 0, L, 496, 110, 20, 0);
-    ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, X, 493, 250, 23, ID_FOLDER);
-    ctl(L"BUTTON", L"Browse...", WS_TABSTOP, X + 256, 492, 74, 25, ID_BROWSE);
+    ctl(L"STATIC", L"MB", 0, X + 68, 442, 40, 20, 0);
+    ctl(L"STATIC", L"Save to", 0, L, 472, 110, 20, 0);
+    ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, X, 469, 250, 23, ID_FOLDER);
+    ctl(L"BUTTON", L"Browse...", WS_TABSTOP, X + 256, 468, 74, 25, ID_BROWSE);
 
-    ctl(L"STATIC", L"", 0, 14, 546, 466, 20, ID_SAVED);
+    ctl(L"STATIC", L"", 0, 14, 522, 466, 20, ID_SAVED);
 }
 
 static void fillCombo(int id, const std::vector<std::pair<std::wstring, int>>& opts, int cur) {
@@ -1299,16 +1306,6 @@ static void refreshGames() {
     SetWindowTextW(c, cur.c_str());
 }
 
-static void updateBitrate() {
-    bool audio = false;
-    for (int i = 0; i < 4; i++) audio |= IsDlgButtonChecked(ui, ID_A_GAME + i) == BST_CHECKED;
-    int secs = std::clamp((int)GetDlgItemInt(ui, ID_SECONDS, nullptr, FALSE), 5, 300);
-    double mb = std::clamp(_wtof(text(ID_MAXMB).c_str()), 1.0, 4000.0);
-    wchar_t b[96];
-    swprintf(b, 96, L"Avg %.1f Mbps. Action gets more bits, calm moments fewer.", videoBitrate(secs, mb, audio) / 1e6);
-    SetDlgItemTextW(ui, ID_BITRATE, b);
-}
-
 static void loadUi() {
     loadingUi = true;
     SetDlgItemTextW(ui, ID_GAME, cfg.game.c_str());
@@ -1328,7 +1325,6 @@ static void loadUi() {
     swprintf(b, 32, L"%g", cfg.maxmb);
     SetDlgItemTextW(ui, ID_MAXMB, b);
     SetDlgItemTextW(ui, ID_FOLDER, cfg.folder.c_str());
-    updateBitrate();
     loadingUi = false;
 }
 
@@ -1475,14 +1471,13 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_BROWSE: browseFolder(); return 0;
         }
         if (code == EN_CHANGE || code == BN_CLICKED || code == CBN_SELCHANGE || code == CBN_EDITCHANGE) {
-            if (id == ID_SECONDS || id == ID_MAXMB || (id >= ID_A_GAME && id <= ID_A_DESKTOP)) updateBitrate();
             scheduleApply();
         }
         return 0;
     }
     case WM_CTLCOLORSTATIC: {
         int id = GetDlgCtrlID((HWND)l);
-        if (id == ID_HINT || id == ID_BITRATE) SetTextColor((HDC)w, GetSysColor(COLOR_GRAYTEXT));
+        if (id == ID_HINT) SetTextColor((HDC)w, GetSysColor(COLOR_GRAYTEXT));
         if (id == ID_SAVED) SetTextColor((HDC)w, text(ID_SAVED).rfind(L"⚠", 0) == 0 ? RGB(190, 90, 0) : RGB(0, 128, 0));
         SetBkColor((HDC)w, GetSysColor(COLOR_BTNFACE));
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
@@ -1586,10 +1581,10 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmd, int) {
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     RegisterClassW(&wc);
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT r{0, 0, 492, 574};
+    RECT r{0, 0, 492, 550};
     AdjustWindowRect(&r, style, FALSE);
     int ww = r.right - r.left, wh = r.bottom - r.top;
-    ui = CreateWindowW(L"Clipper", L"Clipper", style, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2,
+    ui = CreateWindowW(L"Clipper", L"Clipper " CLIPPER_VERSION_W, style, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2,
                        (GetSystemMetrics(SM_CYSCREEN) - wh) / 2, ww, wh, nullptr, nullptr, hi, nullptr);
     buildUi();
 
