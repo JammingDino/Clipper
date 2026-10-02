@@ -16,7 +16,11 @@ Requires Visual Studio (any edition) with the C++ desktop workload.
 build.bat
 ```
 
-Produces `clipper.exe`.
+Produces `clipper.exe`. Set `VERSION` (e.g. `set VERSION=1.2.0`) before building to stamp a version into the window title; otherwise it shows `dev`.
+
+## Releases
+
+Every push to `main` builds `clipper.exe` on GitHub Actions, runs `--selftest`, tags the next `vX.Y.Z` and publishes it as a GitHub release. The bump is decided from commit messages since the last tag: `#major` or `BREAKING CHANGE` → major, `#minor` or `feat:` → minor, otherwise patch. Put `#skip-release` in the head commit message to skip a release.
 
 ## Use
 
