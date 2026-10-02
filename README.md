@@ -6,7 +6,7 @@ Tiny replay-buffer game clipper for Windows. Press a hotkey and the last N secon
 - **Audio:** WASAPI game-only process loopback, Discord, mic, or full desktop → mixer → AAC.
 - Encoded packets sit in RAM; saving is a remux, recompressed only if needed to land under the size cap.
 - Records only while the configured game is running, on the monitor it's on.
-- Single `.cpp`, no dependencies beyond the Windows SDK.
+- Plain C++ in `src/` (one file per stage: `video`, `audio`, `save`, `recorder`, `ui`, `config`), no dependencies beyond the Windows SDK.
 
 ## Build
 
