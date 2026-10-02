@@ -1220,16 +1220,17 @@ enum {
 };
 enum { TIMER_WATCH = 1, TIMER_APPLY = 2 };
 static HFONT uiFont, uiBold;
+static HWND statusTip;
 static bool loadingUi;
 
 // dark theme to match the icon: near-black window, dark grey cards, red accent, square corners
 static const COLORREF C_BG = RGB(16, 16, 20), C_CARD = RGB(28, 29, 35), C_CARDLINE = RGB(40, 41, 49),
                       C_CTRL = RGB(42, 43, 51), C_CTRLHOT = RGB(54, 55, 64), C_LINE = RGB(70, 72, 82),
                       C_TEXT = RGB(236, 236, 240), C_MUTED = RGB(150, 152, 162), C_RED = RGB(222, 22, 42),
-                      C_REDHOT = RGB(255, 64, 80), C_REDDEEP = RGB(150, 6, 24);
+                      C_REDHOT = RGB(255, 64, 80), C_REDDEEP = RGB(150, 6, 24), C_AMBER = RGB(255, 170, 60);
 static HBRUSH brBg, brCard, brCtrl;
 static const struct { RECT r; const wchar_t* title; } cards[] = {
-    {{12, 76, 480, 182}, L"RECORDING"}, {{12, 190, 480, 320}, L"AUDIO"}, {{12, 328, 480, 544}, L"CLIPS"}};
+    {{12, 50, 480, 156}, L"RECORDING"}, {{12, 164, 480, 294}, L"AUDIO"}, {{12, 302, 480, 518}, L"CLIPS"}};
 
 static void box(HDC dc, RECT r, COLORREF fill, COLORREF line) {
     SetDCBrushColor(dc, fill);
@@ -1403,16 +1404,23 @@ static LRESULT CALLBACK hotkeyProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 
 static void buildUi() {
     const int L = 24, X = 140, W = 330;
-    SendMessageW(ctl(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 14, 12, 466, 20, ID_STATUS), WM_SETFONT, (WPARAM)uiBold, TRUE);
-    ctl(L"BUTTON", L"Save clip now", WS_TABSTOP, 12, 38, 140, 28, ID_SAVECLIP);
-    ctl(L"BUTTON", L"Open clips folder", WS_TABSTOP, 160, 38, 140, 28, ID_OPENFOLDER);
+    ctl(L"BUTTON", L"Save clip now", WS_TABSTOP, 12, 12, 140, 28, ID_SAVECLIP);
+    ctl(L"BUTTON", L"Open clips folder", WS_TABSTOP, 160, 12, 140, 28, ID_OPENFOLDER);
+    // status is an icon; the detail text lives in its tooltip
+    HWND st = ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 448, 12, 32, 28, ID_STATUS);
+    statusTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, 0, 0, 0, 0,
+                                ui, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SetWindowTheme(statusTip, L"DarkMode_Explorer", nullptr);
+    TOOLINFOW ti{sizeof(ti), TTF_IDISHWND | TTF_SUBCLASS, ui, (UINT_PTR)st};
+    ti.lpszText = (LPWSTR)L"";
+    SendMessageW(statusTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
 
-    ctl(L"STATIC", L"Game", 0, L, 104, 110, 20, 0);
-    ctl(L"COMBOBOX", L"", CBS_DROPDOWN | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP, X, 100, 250, 300, ID_GAME);
-    ctl(L"BUTTON", L"Refresh", WS_TABSTOP, X + 256, 99, 74, 25, ID_REFRESH);
-    ctl(L"STATIC", L"Only records while this is running. Blank = always record.", 0, X, 127, W, 18, ID_HINT);
-    ctl(L"STATIC", L"Save hotkey", 0, L, 152, 110, 20, 0);
-    HWND hk = ctl(HOTKEY_CLASSW, L"", WS_TABSTOP, X, 149, 160, 24, ID_HOTKEY);
+    ctl(L"STATIC", L"Game", 0, L, 78, 110, 20, 0);
+    ctl(L"COMBOBOX", L"", CBS_DROPDOWN | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP, X, 74, 250, 300, ID_GAME);
+    ctl(L"BUTTON", L"Refresh", WS_TABSTOP, X + 256, 73, 74, 25, ID_REFRESH);
+    ctl(L"STATIC", L"Only records while this is running. Blank = always record.", 0, X, 101, W, 18, ID_HINT);
+    ctl(L"STATIC", L"Save hotkey", 0, L, 126, 110, 20, 0);
+    HWND hk = ctl(HOTKEY_CLASSW, L"", WS_TABSTOP, X, 123, 160, 24, ID_HOTKEY);
     SetWindowSubclass(hk, hotkeyProc, 0, 0);
     SetWindowLongPtrW(hk, GWL_EXSTYLE, 0);  // drop the light client edge the control adds itself
     SetWindowPos(hk, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
@@ -1421,7 +1429,7 @@ static void buildUi() {
     const wchar_t* names[] = {L"Game sound", L"Discord (voice chat)", L"Microphone",
                               L"Everything you hear (desktop), already includes game + Discord"};
     for (int i = 0; i < 4; i++) {
-        int y = 212 + i * 26;
+        int y = 186 + i * 26;
         ctl(L"BUTTON", names[i], BS_AUTOCHECKBOX | WS_TABSTOP, L, y, i == 3 ? 440 : 190, 22, ID_A_GAME + i);
         if (i == 3) break;
         HWND tb = ctl(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_TOOLTIPS | WS_TABSTOP, 230, y - 2, 240, 26, ID_V_GAME + i);
@@ -1430,24 +1438,24 @@ static void buildUi() {
         SetWindowTheme((HWND)SendMessageW(tb, TBM_GETTOOLTIPS, 0, 0), L"DarkMode_Explorer", nullptr);
     }
 
-    ctl(L"STATIC", L"Clip length", 0, L, 354, 110, 20, 0);
-    ctl(L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, X, 351, 60, 23, ID_SECONDS);
+    ctl(L"STATIC", L"Clip length", 0, L, 328, 110, 20, 0);
+    ctl(L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, X, 325, 60, 23, ID_SECONDS);
     HWND ud = ctl(UPDOWN_CLASSW, L"", UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_AUTOBUDDY, 0, 0, 0, 0, ID_SECONDS_UD);
     SendMessageW(ud, UDM_SETRANGE32, 5, 300);
-    ctl(L"STATIC", L"seconds", 0, X + 68, 354, 80, 20, 0);
-    ctl(L"STATIC", L"Resolution", 0, L, 384, 110, 20, 0);
-    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X, 381, 140, 200, ID_HEIGHT);
-    ctl(L"STATIC", L"FPS", 0, X + 160, 384, 30, 20, 0);
-    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X + 195, 381, 70, 200, ID_FPS);
-    ctl(L"BUTTON", L"Crop ultrawide to 16:9 (centre)", BS_AUTOCHECKBOX | WS_TABSTOP, X, 410, W, 22, ID_CROP);
-    ctl(L"STATIC", L"Max file size", 0, L, 442, 110, 20, 0);
-    ctl(L"EDIT", L"", WS_BORDER | WS_TABSTOP, X, 439, 60, 23, ID_MAXMB);
-    ctl(L"STATIC", L"MB", 0, X + 68, 442, 40, 20, 0);
-    ctl(L"STATIC", L"Save to", 0, L, 472, 110, 20, 0);
-    ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, X, 469, 250, 23, ID_FOLDER);
-    ctl(L"BUTTON", L"Browse...", WS_TABSTOP, X + 256, 468, 74, 25, ID_BROWSE);
+    ctl(L"STATIC", L"seconds", 0, X + 68, 328, 80, 20, 0);
+    ctl(L"STATIC", L"Resolution", 0, L, 358, 110, 20, 0);
+    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X, 355, 140, 200, ID_HEIGHT);
+    ctl(L"STATIC", L"FPS", 0, X + 160, 358, 30, 20, 0);
+    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X + 195, 355, 70, 200, ID_FPS);
+    ctl(L"BUTTON", L"Crop ultrawide to 16:9 (centre)", BS_AUTOCHECKBOX | WS_TABSTOP, X, 384, W, 22, ID_CROP);
+    ctl(L"STATIC", L"Max file size", 0, L, 416, 110, 20, 0);
+    ctl(L"EDIT", L"", WS_BORDER | WS_TABSTOP, X, 413, 60, 23, ID_MAXMB);
+    ctl(L"STATIC", L"MB", 0, X + 68, 416, 40, 20, 0);
+    ctl(L"STATIC", L"Save to", 0, L, 446, 110, 20, 0);
+    ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, X, 443, 250, 23, ID_FOLDER);
+    ctl(L"BUTTON", L"Browse...", WS_TABSTOP, X + 256, 442, 74, 25, ID_BROWSE);
 
-    ctl(L"STATIC", L"", 0, 14, 522, 466, 20, ID_SAVED);
+    ctl(L"STATIC", L"", 0, 14, 496, 466, 20, ID_SAVED);
 }
 
 static void fillCombo(int id, const std::vector<std::pair<std::wstring, int>>& opts, int cur) {
@@ -1500,17 +1508,21 @@ static void loadUi() {
 static void updateStatus() {
     std::wstring s;
     if (running) {
-        s = L"● Recording. " + cfg.hotkey + L" saves the last " + std::to_wstring(cfg.seconds) + L"s";
+        s = L"Recording. " + cfg.hotkey + L" saves a clip";
         if (discordMissing) s += L" (Discord not running)";
         if (workerError) s += L" ⚠ capture error, see clipper.log";
     } else {
-        s = L"○ Waiting for " + cfg.game + L" to start";
+        s = L"Waiting for " + cfg.game + L" to start";
     }
     if (saving) s += L"  ·  compressing clip…";
-    SetDlgItemTextW(ui, ID_STATUS, s.c_str());
+    SetDlgItemTextW(ui, ID_STATUS, s.c_str());  // read by screen readers; the icon is drawn in WM_DRAWITEM
+    InvalidateRect(item(ID_STATUS), nullptr, TRUE);
+    TOOLINFOW ti{sizeof(ti), 0, ui, (UINT_PTR)item(ID_STATUS)};
+    ti.lpszText = s.data();
+    SendMessageW(statusTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
     NOTIFYICONDATAW n = nid;
     n.uFlags = NIF_TIP;
-    wcsncpy_s(n.szTip, (L"Clipper: " + s.substr(2)).c_str(), _TRUNCATE);
+    wcsncpy_s(n.szTip, (L"Clipper: " + s).c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &n);
 }
 
@@ -1540,7 +1552,7 @@ static bool registerHotkey() {
 }
 
 static void applyUi() {
-    std::wstring ini = iniPath(), note = L"Saved ✔";
+    std::wstring ini = iniPath(), note;
     auto put = [&](const wchar_t* k, const std::wstring& v) { WritePrivateProfileStringW(L"clipper", k, v.c_str(), ini.c_str()); };
     WORD hk = (WORD)SendMessageW(item(ID_HOTKEY), HKM_GETHOTKEY, 0, 0);
     std::wstring hotkey = formatHotkey(swapAltShift(HIBYTE(hk) & 7), LOBYTE(hk));
@@ -1572,10 +1584,7 @@ static void applyUi() {
     setGains();
     bool restart = old.game != cfg.game || old.audio != cfg.audio || old.height != cfg.height || old.fps != cfg.fps ||
                    old.crop != cfg.crop || old.seconds != cfg.seconds || old.maxmb != cfg.maxmb;  // last two set buffer bitrate
-    if (restart && running) {
-        stopRecording();
-        note += L"  Recording restarted.";
-    }
+    if (restart && running) stopRecording();
     SetDlgItemTextW(ui, ID_SAVED, note.c_str());
     if (old.hotkey != cfg.hotkey) registerHotkey();
     watchGame();
@@ -1647,9 +1656,8 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CTLCOLORSTATIC: {
         int id = GetDlgCtrlID((HWND)l);
         SetTextColor((HDC)w, C_TEXT);
-        if (id == ID_STATUS) SetTextColor((HDC)w, running ? C_REDHOT : C_MUTED);
         if (id == ID_HINT) SetTextColor((HDC)w, C_MUTED);
-        if (id == ID_SAVED) SetTextColor((HDC)w, text(ID_SAVED).rfind(L"⚠", 0) == 0 ? RGB(255, 170, 60) : RGB(90, 210, 130));
+        if (id == ID_SAVED) SetTextColor((HDC)w, C_AMBER);
         bool card = onCard((HWND)l);
         SetBkColor((HDC)w, card ? C_CARD : C_BG);
         return (LRESULT)(card ? brCard : brBg);
@@ -1671,11 +1679,33 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_MEASUREITEM:  // owner-drawn combos: closed field and list rows
         ((MEASUREITEMSTRUCT*)l)->itemHeight = ((MEASUREITEMSTRUCT*)l)->itemID == (UINT)-1 ? 18 : 22;
         return TRUE;
-    case WM_DRAWITEM: {  // owner-drawn combo list rows
+    case WM_DRAWITEM: {
         auto* di = (DRAWITEMSTRUCT*)l;
         HDC dc = di->hDC;
         SelectObject(dc, GetStockObject(DC_BRUSH));
         SetBkMode(dc, TRANSPARENT);
+        if (di->CtlType == ODT_STATIC) {  // status icon: red dot recording, amber dot on a problem, grey ring waiting
+            // drawn 4x and scaled down with HALFTONE: GDI has no antialiasing
+            const int k = 4, w = (di->rcItem.right - di->rcItem.left) * k, h = (di->rcItem.bottom - di->rcItem.top) * k, d = 16 * k;
+            COLORREF c = !running ? C_MUTED : workerError || discordMissing ? C_AMBER : saving ? C_TEXT : C_RED;
+            HDC m = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, w, h);
+            HGDIOBJ oldBmp = SelectObject(m, bmp);
+            RECT all{0, 0, w, h};
+            FillRect(m, &all, brBg);
+            HPEN pen = CreatePen(PS_SOLID, 2 * k, c);
+            SelectObject(m, pen);
+            SelectObject(m, GetStockObject(DC_BRUSH));
+            SetDCBrushColor(m, running ? c : C_BG);
+            Ellipse(m, (w - d) / 2 + k, (h - d) / 2 + k, (w + d) / 2 - k, (h + d) / 2 - k);
+            SetStretchBltMode(dc, HALFTONE);
+            StretchBlt(dc, di->rcItem.left, di->rcItem.top, w / k, h / k, m, 0, 0, w, h, SRCCOPY);
+            SelectObject(m, oldBmp);
+            DeleteDC(m);
+            DeleteObject(bmp);
+            DeleteObject(pen);
+            return TRUE;
+        }
         SetDCBrushColor(dc, di->itemState & ODS_SELECTED ? C_RED : C_CTRL);
         FillRect(dc, &di->rcItem, (HBRUSH)GetStockObject(DC_BRUSH));
         wchar_t t[MAX_PATH] = L"";
@@ -1810,7 +1840,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmd, int) {
     wc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
     RegisterClassW(&wc);
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT r{0, 0, 492, 550};
+    RECT r{0, 0, 492, 524};
     AdjustWindowRect(&r, style, FALSE);
     int ww = r.right - r.left, wh = r.bottom - r.top;
     ui = CreateWindowW(L"Clipper", L"Clipper " CLIPPER_VERSION_W, style, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2,
