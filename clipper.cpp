@@ -1255,7 +1255,8 @@ static std::vector<std::wstring> windowedApps() {
 enum {
     ID_STATUS = 100, ID_SAVECLIP, ID_OPENFOLDER, ID_GAME, ID_REFRESH, ID_HINT, ID_HOTKEY,
     ID_A_GAME, ID_A_DISCORD, ID_A_MIC, ID_A_DESKTOP, ID_V_GAME, ID_V_DISCORD, ID_V_MIC,
-    ID_SECONDS, ID_SECONDS_UD, ID_HEIGHT, ID_FPS, ID_CROP, ID_MAXMB, ID_FOLDER, ID_BROWSE, ID_SAVED
+    ID_SECONDS, ID_SECONDS_UD, ID_HEIGHT, ID_FPS, ID_CROP, ID_MAXMB, ID_FOLDER, ID_BROWSE, ID_HKHINT,
+    ID_AQUALITY, ID_MONO, ID_BITRATE, ID_ESTIMATE
 };
 enum { TIMER_WATCH = 1, TIMER_APPLY = 2 };
 static HFONT uiFont, uiBold;
@@ -1269,7 +1270,7 @@ static const COLORREF C_BG = RGB(16, 16, 20), C_CARD = RGB(28, 29, 35), C_CARDLI
                       C_REDHOT = RGB(255, 64, 80), C_REDDEEP = RGB(150, 6, 24), C_AMBER = RGB(255, 170, 60);
 static HBRUSH brBg, brCard, brCtrl;
 static const struct { RECT r; const wchar_t* title; } cards[] = {
-    {{12, 50, 480, 156}, L"RECORDING"}, {{12, 164, 480, 294}, L"AUDIO"}, {{12, 302, 480, 518}, L"CLIPS"}};
+    {{12, 50, 480, 174}, L"RECORDING"}, {{12, 182, 480, 342}, L"AUDIO"}, {{12, 350, 480, 558}, L"CLIPS"}};
 
 static void box(HDC dc, RECT r, COLORREF fill, COLORREF line) {
     SetDCBrushColor(dc, fill);
@@ -1441,6 +1442,8 @@ static LRESULT CALLBACK hotkeyProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
     return 0;
 }
 
+static const wchar_t kHotkeyHint[] = L"Click the box, then press the key combo you want.";
+
 static void buildUi() {
     const int L = 24, X = 140, W = 330;
     ctl(L"BUTTON", L"Save clip now", WS_TABSTOP, 12, 12, 140, 28, ID_SAVECLIP);
@@ -1464,11 +1467,12 @@ static void buildUi() {
     SetWindowLongPtrW(hk, GWL_EXSTYLE, 0);  // drop the light client edge the control adds itself
     SetWindowPos(hk, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     SendMessageW(hk, HKM_SETRULES, 0, 0);
+    ctl(L"STATIC", kHotkeyHint, SS_NOPREFIX, X, 150, W, 18, ID_HKHINT);
 
     const wchar_t* names[] = {L"Game sound", L"Discord (voice chat)", L"Microphone",
                               L"Everything you hear (desktop), already includes game + Discord"};
     for (int i = 0; i < 4; i++) {
-        int y = 186 + i * 26;
+        int y = 206 + i * 26;
         ctl(L"BUTTON", names[i], BS_AUTOCHECKBOX | WS_TABSTOP, L, y, i == 3 ? 440 : 190, 22, ID_A_GAME + i);
         if (i == 3) break;
         HWND tb = ctl(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_TOOLTIPS | WS_TABSTOP, 230, y - 2, 240, 26, ID_V_GAME + i);
@@ -1476,25 +1480,29 @@ static void buildUi() {
         SendMessageW(tb, TBM_SETTIC, 0, 100);
         SetWindowTheme((HWND)SendMessageW(tb, TBM_GETTOOLTIPS, 0, 0), L"DarkMode_Explorer", nullptr);
     }
+    ctl(L"STATIC", L"Quality", 0, L, 313, 110, 20, 0);
+    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X, 309, 160, 200, ID_AQUALITY);
+    ctl(L"BUTTON", L"Mono", BS_AUTOCHECKBOX | WS_TABSTOP, X + 180, 310, 120, 22, ID_MONO);
 
-    ctl(L"STATIC", L"Clip length", 0, L, 328, 110, 20, 0);
-    ctl(L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, X, 325, 60, 23, ID_SECONDS);
+    ctl(L"STATIC", L"Clip length", 0, L, 376, 110, 20, 0);
+    ctl(L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, X, 373, 60, 23, ID_SECONDS);
     HWND ud = ctl(UPDOWN_CLASSW, L"", UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_AUTOBUDDY, 0, 0, 0, 0, ID_SECONDS_UD);
     SendMessageW(ud, UDM_SETRANGE32, 5, 300);
-    ctl(L"STATIC", L"seconds", 0, X + 68, 328, 80, 20, 0);
-    ctl(L"STATIC", L"Resolution", 0, L, 358, 110, 20, 0);
-    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X, 355, 140, 200, ID_HEIGHT);
-    ctl(L"STATIC", L"FPS", 0, X + 160, 358, 30, 20, 0);
-    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X + 195, 355, 70, 200, ID_FPS);
-    ctl(L"BUTTON", L"Crop ultrawide to 16:9 (centre)", BS_AUTOCHECKBOX | WS_TABSTOP, X, 384, W, 22, ID_CROP);
-    ctl(L"STATIC", L"Max file size", 0, L, 416, 110, 20, 0);
-    ctl(L"EDIT", L"", WS_BORDER | WS_TABSTOP, X, 413, 60, 23, ID_MAXMB);
-    ctl(L"STATIC", L"MB", 0, X + 68, 416, 40, 20, 0);
-    ctl(L"STATIC", L"Save to", 0, L, 446, 110, 20, 0);
-    ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, X, 443, 250, 23, ID_FOLDER);
-    ctl(L"BUTTON", L"Browse...", WS_TABSTOP, X + 256, 442, 74, 25, ID_BROWSE);
-
-    ctl(L"STATIC", L"", 0, 14, 496, 466, 20, ID_SAVED);
+    ctl(L"STATIC", L"seconds", 0, X + 68, 376, 80, 20, 0);
+    ctl(L"STATIC", L"Resolution", 0, L, 406, 110, 20, 0);
+    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X, 403, 160, 200, ID_HEIGHT);
+    ctl(L"STATIC", L"FPS", 0, X + 180, 406, 30, 20, 0);
+    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X + 214, 403, 70, 200, ID_FPS);
+    ctl(L"BUTTON", L"Crop ultrawide to 16:9 (centre)", BS_AUTOCHECKBOX | WS_TABSTOP, X, 432, W, 22, ID_CROP);
+    ctl(L"STATIC", L"Video bitrate", 0, L, 464, 110, 20, 0);
+    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X, 461, 160, 300, ID_BITRATE);
+    ctl(L"STATIC", L"Max", 0, X + 180, 464, 30, 20, 0);
+    ctl(L"EDIT", L"", WS_BORDER | WS_TABSTOP, X + 214, 461, 50, 23, ID_MAXMB);
+    ctl(L"STATIC", L"MB", 0, X + 270, 464, 30, 20, 0);
+    ctl(L"STATIC", L"", SS_NOPREFIX, X, 489, W, 32, ID_ESTIMATE);
+    ctl(L"STATIC", L"Save to", 0, L, 528, 110, 20, 0);
+    ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, X, 525, 250, 23, ID_FOLDER);
+    ctl(L"BUTTON", L"Browse...", WS_TABSTOP, X + 256, 524, 74, 25, ID_BROWSE);
 }
 
 static void fillCombo(int id, const std::vector<std::pair<std::wstring, int>>& opts, int cur) {
@@ -1522,6 +1530,29 @@ static void refreshGames() {
     SetWindowTextW(c, cur.c_str());
 }
 
+// live size/bitrate estimate from what's in the window right now (before it's applied)
+static void updateEstimate() {
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm);  // physical pixels of the primary monitor
+    UINT w = dm.dmPelsWidth ? dm.dmPelsWidth : 1920, h = dm.dmPelsHeight ? dm.dmPelsHeight : 1080;
+    if (IsDlgButtonChecked(ui, ID_CROP) == BST_CHECKED) w = std::min(w, h * 16 / 9);
+    bool audio = false;
+    for (int i = 0; i < 4; i++) audio |= IsDlgButtonChecked(ui, ID_A_GAME + i) == BST_CHECKED;
+    int secs = std::clamp((int)GetDlgItemInt(ui, ID_SECONDS, nullptr, FALSE), 5, 300), kbps = comboValue(ID_BITRATE);
+    double maxmb = std::clamp(_wtof(text(ID_MAXMB).c_str()), 1.0, 4000.0);
+    Estimate e = estimate(secs, maxmb, kbps, audio ? comboValue(ID_AQUALITY) * 1000 : 0, comboValue(ID_HEIGHT), w, h);
+    wchar_t b[256];
+    if (!kbps)
+        swprintf(b, 256, L"Each %ds clip is compressed to just under %g MB: about %.1f Mbps video at %up.", secs, maxmb, e.vbps / 1e6, e.h);
+    else if (e.mb <= maxmb)
+        swprintf(b, 256, L"Up to about %.1f MB per %ds clip at %up, saved instantly. Up to %ds always fits %g MB.", e.mb, secs, e.h, (int)e.secsFit, maxmb);
+    else
+        swprintf(b, 256, L"Up to about %.1f MB per %ds clip: busy clips over %g MB are re-compressed to fit. Up to %ds always saves as-is.",
+                 e.mb, secs, maxmb, (int)e.secsFit);
+    SetDlgItemTextW(ui, ID_ESTIMATE, b);
+}
+
 static void loadUi() {
     loadingUi = true;
     SetDlgItemTextW(ui, ID_GAME, cfg.game.c_str());
@@ -1541,7 +1572,14 @@ static void loadUi() {
     swprintf(b, 32, L"%g", cfg.maxmb);
     SetDlgItemTextW(ui, ID_MAXMB, b);
     SetDlgItemTextW(ui, ID_FOLDER, cfg.folder.c_str());
+    fillCombo(ID_AQUALITY, {{L"High (192 kbps)", 192}, {L"Good (160 kbps)", 160}, {L"Standard (128 kbps)", 128}, {L"Small (96 kbps)", 96}},
+              cfg.audiokbps);
+    CheckDlgButton(ui, ID_MONO, cfg.mono ? BST_CHECKED : BST_UNCHECKED);
+    fillCombo(ID_BITRATE, {{L"Auto (fit max size)", 0}, {L"4 Mbps", 4000}, {L"6 Mbps", 6000}, {L"8 Mbps", 8000}, {L"12 Mbps", 12000},
+                           {L"16 Mbps", 16000}, {L"20 Mbps", 20000}, {L"30 Mbps", 30000}, {L"50 Mbps", 50000}}, cfg.bitrate);
+    SetDlgItemTextW(ui, ID_HKHINT, kHotkeyHint);
     loadingUi = false;
+    updateEstimate();
 }
 
 static void updateStatus() {
@@ -1586,7 +1624,7 @@ static bool registerHotkey() {
     UINT mods, vk;
     UnregisterHotKey(ui, 1);
     if (parseHotkey(cfg.hotkey, mods, vk) && RegisterHotKey(ui, 1, mods, vk)) return true;
-    SetDlgItemTextW(ui, ID_SAVED, (L"⚠ Hotkey " + cfg.hotkey + L" is taken by another program. Pick another.").c_str());
+    SetDlgItemTextW(ui, ID_HKHINT, (L"⚠ " + cfg.hotkey + L" is taken by another program. Pick another.").c_str());
     return false;
 }
 
@@ -1595,7 +1633,7 @@ static void applyUi() {
     auto put = [&](const wchar_t* k, const std::wstring& v) { WritePrivateProfileStringW(L"clipper", k, v.c_str(), ini.c_str()); };
     WORD hk = (WORD)SendMessageW(item(ID_HOTKEY), HKM_GETHOTKEY, 0, 0);
     std::wstring hotkey = formatHotkey(swapAltShift(HIBYTE(hk) & 7), LOBYTE(hk));
-    if (hotkey.empty()) note = L"⚠ Hotkey must be F1-F24, a letter/number, or Insert/Home/End/PgUp/PgDn/Pause.";
+    if (hotkey.empty()) note = L"⚠ Use F1-F24, A-Z, 0-9 or Ins/Home/End/PgUp/PgDn/Pause.";
     else put(L"hotkey", hotkey);
     std::wstring audio;
     const wchar_t* src[] = {L"game", L"discord", L"mic", L"desktop"};
@@ -1616,22 +1654,25 @@ static void applyUi() {
     put(L"fps", std::to_wstring(comboValue(ID_FPS)));
     put(L"crop", IsDlgButtonChecked(ui, ID_CROP) == BST_CHECKED ? L"1" : L"0");
     put(L"maxmb", text(ID_MAXMB));
+    put(L"bitrate", std::to_wstring(comboValue(ID_BITRATE)));
+    put(L"audiokbps", std::to_wstring(comboValue(ID_AQUALITY)));
+    put(L"mono", IsDlgButtonChecked(ui, ID_MONO) == BST_CHECKED ? L"1" : L"0");
     put(L"folder", text(ID_FOLDER));
 
     Config old = cfg;
     loadConfig();
     setGains();
     bool restart = old.game != cfg.game || old.audio != cfg.audio || old.height != cfg.height || old.fps != cfg.fps ||
-                   old.crop != cfg.crop || old.seconds != cfg.seconds || old.maxmb != cfg.maxmb;  // last two set buffer bitrate
+                   old.crop != cfg.crop || old.seconds != cfg.seconds || old.maxmb != cfg.maxmb ||  // these two set auto bitrate
+                   old.bitrate != cfg.bitrate || old.audiokbps != cfg.audiokbps || old.mono != cfg.mono;
     if (restart && running) stopRecording();
-    SetDlgItemTextW(ui, ID_SAVED, note.c_str());
+    SetDlgItemTextW(ui, ID_HKHINT, note.empty() ? kHotkeyHint : note.c_str());
     if (old.hotkey != cfg.hotkey) registerHotkey();
     watchGame();
 }
 
 static void scheduleApply() {
     if (loadingUi) return;
-    SetDlgItemTextW(ui, ID_SAVED, L"");
     SetTimer(ui, TIMER_APPLY, 600, nullptr);
 }
 
@@ -1688,6 +1729,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_BROWSE: browseFolder(); return 0;
         }
         if (code == EN_CHANGE || code == BN_CLICKED || code == CBN_SELCHANGE || code == CBN_EDITCHANGE) {
+            if (!loadingUi) updateEstimate();
             scheduleApply();
         }
         return 0;
@@ -1695,8 +1737,8 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CTLCOLORSTATIC: {
         int id = GetDlgCtrlID((HWND)l);
         SetTextColor((HDC)w, C_TEXT);
-        if (id == ID_HINT) SetTextColor((HDC)w, C_MUTED);
-        if (id == ID_SAVED) SetTextColor((HDC)w, C_AMBER);
+        if (id == ID_HINT || id == ID_ESTIMATE) SetTextColor((HDC)w, C_MUTED);
+        if (id == ID_HKHINT) SetTextColor((HDC)w, text(ID_HKHINT).rfind(L"⚠", 0) == 0 ? C_AMBER : C_MUTED);
         bool card = onCard((HWND)l);
         SetBkColor((HDC)w, card ? C_CARD : C_BG);
         return (LRESULT)(card ? brCard : brBg);
@@ -1884,7 +1926,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmd, int) {
     wc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
     RegisterClassW(&wc);
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT r{0, 0, 492, 524};
+    RECT r{0, 0, 492, 566};
     AdjustWindowRect(&r, style, FALSE);
     int ww = r.right - r.left, wh = r.bottom - r.top;
     ui = CreateWindowW(L"Clipper", L"Clipper " CLIPPER_VERSION_W, style, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2,
