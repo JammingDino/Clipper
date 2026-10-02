@@ -11,6 +11,7 @@
 #include <commctrl.h>
 #include <uxtheme.h>
 #include <dwmapi.h>
+#include <avrt.h>
 #include <tlhelp32.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
@@ -54,6 +55,7 @@
 #pragma comment(lib, "comctl32")
 #pragma comment(lib, "uxtheme")
 #pragma comment(lib, "dwmapi")
+#pragma comment(lib, "avrt")
 #pragma comment(lib, "gdi32")
 #pragma comment(lib, "d3dcompiler")
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df'\"")
@@ -279,6 +281,7 @@ static bool parseHotkey(std::wstring s, UINT& mods, UINT& vk) {
 
 // ---------- clock: everything is 100ns units since recording start ----------
 static LONGLONG qpcFreq, startHns;
+static std::atomic<int> droppedFrames;  // capture ticks that produced no frame (encoder busy / thread stalled)
 static LONGLONG qpcToHns(LONGLONG q) { return q / qpcFreq * 10000000 + q % qpcFreq * 10000000 / qpcFreq; }
 static LONGLONG nowHns() {
     LARGE_INTEGER q;
@@ -398,6 +401,16 @@ static bool videoLoop(HMONITOR mon, HWND win) {
                             D3D11_SDK_VERSION, &dev, nullptr, &ctx));
     ComPtr<ID3D11Multithread> mt;
     if (SUCCEEDED(ctx.As(&mt))) mt->SetMultithreadProtected(TRUE);
+    // A game maxing the GPU/CPU must not starve our one copy + encode per frame (that's what drops frames):
+    // high GPU scheduling priority like OBS, and an MMCSS "Capture" boost for this thread.
+    ComPtr<IDXGIDevice> dxdev;
+    HRESULT gpuPrio = SUCCEEDED(dev.As(&dxdev)) ? dxdev->SetGPUThreadPriority(7) : E_FAIL;
+    auto setGpuClass = (LONG(WINAPI*)(HANDLE, int))GetProcAddress(GetModuleHandleW(L"gdi32.dll"), "D3DKMTSetProcessSchedulingPriorityClass");
+    LONG gpuClass = setGpuClass ? setGpuClass(GetCurrentProcess(), 4 /* D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH */) : -1;
+    DWORD task = 0;
+    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Capture", &task);
+    logf(L"priority: gpu thread %ls, gpu class %ls, mmcss %ls", SUCCEEDED(gpuPrio) ? L"ok" : L"failed",
+         gpuClass == 0 ? L"high" : L"failed", mmcss ? L"ok" : L"failed");
     ComPtr<ID3D11VideoDevice> vdev;
     ComPtr<ID3D11VideoContext> vctx;
     CHECK(dev.As(&vdev));
@@ -481,10 +494,18 @@ static bool videoLoop(HMONITOR mon, HWND win) {
     if (SUCCEEDED(enc.As(&api))) {
         VARIANT v;
         v.vt = VT_UI4;
-        v.ulVal = eAVEncCommonRateControlMode_CBR;
-        api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v);
+        // VBR: busy moments borrow bits from calm ones (peaks up to 2x the average); CBR if the encoder won't
+        v.ulVal = eAVEncCommonRateControlMode_PeakConstrainedVBR;
+        bool isVbr = SUCCEEDED(api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v));
+        if (!isVbr) {
+            v.ulVal = eAVEncCommonRateControlMode_CBR;
+            api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v);
+        }
         v.ulVal = vbr;
         api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v);
+        v.ulVal = (ULONG)std::min<UINT64>(2ull * vbr, 200000000);
+        if (isVbr) api->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &v);
+        logf(L"buffer rate control: %ls", isVbr ? L"peak-constrained VBR" : L"CBR (VBR not supported)");
         v.ulVal = fps;  // keyframe every second = clip start granularity
         api->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
     }
@@ -606,6 +627,7 @@ static bool videoLoop(HMONITOR mon, HWND win) {
             SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
             WaitForSingleObject(timer, INFINITE);
         } else if (wait < -4 * frameHns) {
+            droppedFrames += (int)(-wait / frameHns);
             next = nowHns();  // fell behind (e.g. system stall): skip ahead instead of bursting
         }
         captureRect(win, monRc, cap);  // follow the window as it moves
@@ -687,10 +709,14 @@ static bool videoLoop(HMONITOR mon, HWND win) {
                 s->SetSampleTime(next);
                 s->SetSampleDuration(frameHns);
                 if (SUCCEEDED(enc->ProcessInput(0, s.Get(), 0))) credits--;
+                else droppedFrames++;
             }
+        } else if (haveFrame) {
+            droppedFrames++;  // encoder still busy with earlier frames
         }
     }
     CloseHandle(timer);
+    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
     enc->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     enc.Reset();
     act->ShutdownObject();
@@ -1061,7 +1087,8 @@ static void compressAndSave(std::vector<Packet> v, size_t s, std::vector<Packet>
         MFGetAttributeSize(vt.Get(), MF_MT_FRAME_SIZE, &bufW, &bufH);
         double secs = (v.back().t + v.back().dur - v[s].t) / 1e7;
         size = fileSize(src);
-        logf(L"saving %.1fs clip, buffer %ux%u %.1f MB", secs, bufW, bufH, size / 1e6);
+        logf(L"saving %.1fs clip, buffer %ux%u %.1f MB, %d frames dropped since the last save", secs, bufW, bufH, size / 1e6,
+             droppedFrames.exchange(0));
         bool fits = size <= limit;
         size = 0;
         if (keepIfFits && fits) {  // fixed bitrate and under the cap: the buffer is the clip
