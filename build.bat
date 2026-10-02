@@ -6,5 +6,6 @@ for /f "usebackq delims=" %%i in (`call "!VSWHERE!" -latest -products * -propert
 call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 set "VERDEF="
 if defined VERSION set "VERDEF=/DCLIPPER_VERSION=%VERSION%"
-cl /nologo /O1 /MT /EHsc /std:c++17 /W3 /utf-8 /DUNICODE /D_CRT_SECURE_NO_WARNINGS %VERDEF% clipper.cpp /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /OUT:clipper.exe
+rc /nologo clipper.rc || exit /b 1
+cl /nologo /O1 /MT /EHsc /std:c++17 /W3 /utf-8 /DUNICODE /D_CRT_SECURE_NO_WARNINGS %VERDEF% clipper.cpp clipper.res /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /OUT:clipper.exe
 exit /b %errorlevel%

@@ -1578,7 +1578,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmd, int) {
     wc.lpszClassName = L"Clipper";
     wc.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
     RegisterClassW(&wc);
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     RECT r{0, 0, 492, 550};
@@ -1592,7 +1592,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmd, int) {
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = TRAY_MSG;
-    nid.hIcon = wc.hIcon;
+    nid.hIcon = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     wcscpy_s(nid.szTip, L"Clipper");
     Shell_NotifyIconW(NIM_ADD, &nid);
     loadUi();
