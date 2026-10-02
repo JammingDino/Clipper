@@ -9,6 +9,8 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <commctrl.h>
+#include <uxtheme.h>
+#include <dwmapi.h>
 #include <tlhelp32.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
@@ -50,6 +52,8 @@
 #pragma comment(lib, "mmdevapi")
 #pragma comment(lib, "wmcodecdspuuid")
 #pragma comment(lib, "comctl32")
+#pragma comment(lib, "uxtheme")
+#pragma comment(lib, "dwmapi")
 #pragma comment(lib, "gdi32")
 #pragma comment(lib, "d3dcompiler")
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df'\"")
@@ -1218,11 +1222,101 @@ enum { TIMER_WATCH = 1, TIMER_APPLY = 2 };
 static HFONT uiFont, uiBold;
 static bool loadingUi;
 
+// dark theme to match the icon: near-black window, dark grey cards, red accent, square corners
+static const COLORREF C_BG = RGB(16, 16, 20), C_CARD = RGB(28, 29, 35), C_CARDLINE = RGB(40, 41, 49),
+                      C_CTRL = RGB(42, 43, 51), C_CTRLHOT = RGB(54, 55, 64), C_LINE = RGB(70, 72, 82),
+                      C_TEXT = RGB(236, 236, 240), C_MUTED = RGB(150, 152, 162), C_RED = RGB(222, 22, 42),
+                      C_REDHOT = RGB(255, 64, 80), C_REDDEEP = RGB(150, 6, 24);
+static HBRUSH brBg, brCard, brCtrl;
+static const struct { RECT r; const wchar_t* title; } cards[] = {
+    {{12, 76, 480, 182}, L"RECORDING"}, {{12, 190, 480, 320}, L"AUDIO"}, {{12, 328, 480, 544}, L"CLIPS"}};
+
 static HWND ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id) {
     HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, ui, (HMENU)(INT_PTR)id,
                              GetModuleHandleW(nullptr), nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)uiFont, TRUE);
+    SetWindowTheme(c, wcscmp(cls, L"COMBOBOX") ? L"DarkMode_Explorer" : L"DarkMode_CFD", nullptr);
+    COMBOBOXINFO ci{sizeof(ci)};
+    if (GetComboBoxInfo(c, &ci)) SetWindowTheme(ci.hwndList, L"DarkMode_Explorer", nullptr);  // dark dropdown scrollbar
     return c;
+}
+static bool onCard(HWND c) {
+    int id = GetDlgCtrlID(c);
+    return id != ID_STATUS && id != ID_SAVECLIP && id != ID_OPENFOLDER;
+}
+static void box(HDC dc, RECT r, COLORREF fill, COLORREF line) {
+    SetDCBrushColor(dc, fill);
+    SetDCPenColor(dc, line);
+    Rectangle(dc, r.left, r.top, r.right, r.bottom);
+}
+
+// buttons and checkboxes are painted here (NM_CUSTOMDRAW) so they keep their native behaviour
+static LRESULT drawButton(NMCUSTOMDRAW* cd) {
+    if (cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
+    HWND b = cd->hdr.hwndFrom;
+    HDC dc = cd->hdc;
+    RECT r = cd->rc;
+    bool hot = cd->uItemState & CDIS_HOT, down = cd->uItemState & CDIS_SELECTED;
+    bool focus = (cd->uItemState & CDIS_FOCUS) && !(SendMessageW(b, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS);
+    wchar_t t[128];
+    GetWindowTextW(b, t, 128);
+    SaveDC(dc);
+    FillRect(dc, &r, onCard(b) ? brCard : brBg);
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(DC_PEN));
+    SelectObject(dc, uiFont);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, C_TEXT);
+    if ((GetWindowLongW(b, GWL_STYLE) & BS_TYPEMASK) == BS_AUTOCHECKBOX) {
+        bool on = SendMessageW(b, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        int y = (r.top + r.bottom) / 2;
+        RECT k{r.left, y - 8, r.left + 16, y + 8};
+        COLORREF red = hot ? C_REDHOT : C_RED;
+        box(dc, k, on ? red : C_CTRL, on ? red : hot || focus ? C_REDHOT : C_LINE);
+        if (on) {
+            HPEN p = CreatePen(PS_SOLID, 2, C_TEXT);
+            SelectObject(dc, p);
+            POINT v[] = {{k.left + 4, y}, {k.left + 7, y + 3}, {k.left + 12, y - 3}};
+            Polyline(dc, v, 3);
+            SelectObject(dc, GetStockObject(DC_PEN));
+            DeleteObject(p);
+        }
+        r.left += 24;
+        DrawTextW(dc, t, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    } else {
+        bool primary = GetDlgCtrlID(b) == ID_SAVECLIP;
+        COLORREF fill = primary ? (down ? C_REDDEEP : hot ? C_REDHOT : C_RED) : (down ? C_LINE : hot ? C_CTRLHOT : C_CTRL);
+        box(dc, r, fill, focus ? (primary ? C_TEXT : C_REDHOT) : primary ? fill : C_LINE);
+        DrawTextW(dc, t, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+    }
+    RestoreDC(dc, -1);
+    return CDRF_SKIPDEFAULT;
+}
+
+// volume sliders: thin track filled red up to a square thumb, small mark at 100%
+static LRESULT drawSlider(NMCUSTOMDRAW* cd) {
+    if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+    if (cd->dwDrawStage != CDDS_ITEMPREPAINT || cd->dwItemSpec == TBCD_TICS) return CDRF_SKIPDEFAULT;
+    HWND tb = cd->hdr.hwndFrom;
+    HDC dc = cd->hdc;
+    RECT th, r;
+    SendMessageW(tb, TBM_GETTHUMBRECT, 0, (LPARAM)&th);
+    int x = (th.left + th.right) / 2, y = (th.top + th.bottom) / 2;
+    SaveDC(dc);
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(DC_PEN));
+    if (cd->dwItemSpec == TBCD_CHANNEL) {
+        int tic = (int)SendMessageW(tb, TBM_GETTICPOS, 0, 0);
+        box(dc, {tic - 1, y + 5, tic + 1, y + 10}, C_MUTED, C_MUTED);
+        box(dc, {cd->rc.left, y - 2, cd->rc.right, y + 2}, C_LINE, C_LINE);
+        box(dc, {cd->rc.left, y - 2, x, y + 2}, C_RED, C_RED);
+    } else {
+        bool hot = cd->uItemState & (CDIS_HOT | CDIS_SELECTED);
+        r = {x - 5, y - 9, x + 5, y + 9};
+        box(dc, r, hot ? C_REDHOT : C_TEXT, hot ? C_REDHOT : C_TEXT);
+    }
+    RestoreDC(dc, -1);
+    return CDRF_SKIPDEFAULT;
 }
 static HWND item(int id) { return GetDlgItem(ui, id); }
 static std::wstring text(int id) {
@@ -1232,12 +1326,36 @@ static std::wstring text(int id) {
 }
 static UINT swapAltShift(UINT m) { return (m & 2) | (m & 1 ? 4 : 0) | (m & 4 ? 1 : 0); }  // MOD_* <-> HOTKEYF_*
 
+// the hotkey control ignores WM_CTLCOLOR*, so paint it ourselves; a red border replaces its caret
+static LRESULT CALLBACK hotkeyProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (m == WM_SETFOCUS || m == WM_KILLFOCUS) {
+        LRESULT r = DefSubclassProc(h, m, w, l);
+        HideCaret(h);
+        InvalidateRect(h, nullptr, TRUE);
+        return r;
+    }
+    if (m == WM_ERASEBKGND) return 1;
+    if (m != WM_PAINT) return DefSubclassProc(h, m, w, l);
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT r;
+    GetClientRect(h, &r);
+    WORD k = (WORD)SendMessageW(h, HKM_GETHOTKEY, 0, 0);
+    std::wstring t = formatHotkey(swapAltShift(HIBYTE(k) & 7), LOBYTE(k));
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(DC_PEN));
+    SelectObject(dc, uiFont);
+    box(dc, r, C_CTRL, GetFocus() == h ? C_REDHOT : C_LINE);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, t.empty() ? C_MUTED : C_TEXT);
+    r.left += 6;
+    DrawTextW(dc, t.empty() ? L"Press a key" : t.c_str(), -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    EndPaint(h, &ps);
+    return 0;
+}
+
 static void buildUi() {
     const int L = 24, X = 140, W = 330;
-    ctl(L"BUTTON", L"Recording", BS_GROUPBOX, 12, 78, 468, 104, 0);
-    ctl(L"BUTTON", L"Audio", BS_GROUPBOX, 12, 190, 468, 130, 0);
-    ctl(L"BUTTON", L"Clips", BS_GROUPBOX, 12, 328, 468, 208, 0);
-
     SendMessageW(ctl(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 14, 12, 466, 20, ID_STATUS), WM_SETFONT, (WPARAM)uiBold, TRUE);
     ctl(L"BUTTON", L"Save clip now", WS_TABSTOP, 12, 38, 140, 28, ID_SAVECLIP);
     ctl(L"BUTTON", L"Open clips folder", WS_TABSTOP, 160, 38, 140, 28, ID_OPENFOLDER);
@@ -1247,7 +1365,10 @@ static void buildUi() {
     ctl(L"BUTTON", L"Refresh", WS_TABSTOP, X + 256, 99, 74, 25, ID_REFRESH);
     ctl(L"STATIC", L"Only records while this is running. Blank = always record.", 0, X, 127, W, 18, ID_HINT);
     ctl(L"STATIC", L"Save hotkey", 0, L, 152, 110, 20, 0);
-    HWND hk = ctl(HOTKEY_CLASSW, L"", WS_TABSTOP | WS_BORDER, X, 149, 160, 24, ID_HOTKEY);
+    HWND hk = ctl(HOTKEY_CLASSW, L"", WS_TABSTOP, X, 149, 160, 24, ID_HOTKEY);
+    SetWindowSubclass(hk, hotkeyProc, 0, 0);
+    SetWindowLongPtrW(hk, GWL_EXSTYLE, 0);  // drop the light client edge the control adds itself
+    SetWindowPos(hk, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     SendMessageW(hk, HKM_SETRULES, 0, 0);
 
     const wchar_t* names[] = {L"Game sound", L"Discord (voice chat)", L"Microphone",
@@ -1259,6 +1380,7 @@ static void buildUi() {
         HWND tb = ctl(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_TOOLTIPS | WS_TABSTOP, 230, y - 2, 240, 26, ID_V_GAME + i);
         SendMessageW(tb, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
         SendMessageW(tb, TBM_SETTIC, 0, 100);
+        SetWindowTheme((HWND)SendMessageW(tb, TBM_GETTOOLTIPS, 0, 0), L"DarkMode_Explorer", nullptr);
     }
 
     ctl(L"STATIC", L"Clip length", 0, L, 354, 110, 20, 0);
@@ -1477,10 +1599,44 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_CTLCOLORSTATIC: {
         int id = GetDlgCtrlID((HWND)l);
-        if (id == ID_HINT) SetTextColor((HDC)w, GetSysColor(COLOR_GRAYTEXT));
-        if (id == ID_SAVED) SetTextColor((HDC)w, text(ID_SAVED).rfind(L"⚠", 0) == 0 ? RGB(190, 90, 0) : RGB(0, 128, 0));
-        SetBkColor((HDC)w, GetSysColor(COLOR_BTNFACE));
-        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        SetTextColor((HDC)w, C_TEXT);
+        if (id == ID_STATUS) SetTextColor((HDC)w, running ? C_REDHOT : C_MUTED);
+        if (id == ID_HINT) SetTextColor((HDC)w, C_MUTED);
+        if (id == ID_SAVED) SetTextColor((HDC)w, text(ID_SAVED).rfind(L"⚠", 0) == 0 ? RGB(255, 170, 60) : RGB(90, 210, 130));
+        bool card = onCard((HWND)l);
+        SetBkColor((HDC)w, card ? C_CARD : C_BG);
+        return (LRESULT)(card ? brCard : brBg);
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+        SetTextColor((HDC)w, C_TEXT);
+        SetBkColor((HDC)w, C_CTRL);
+        return (LRESULT)brCtrl;
+    case WM_NOTIFY: {
+        auto* cd = (NMCUSTOMDRAW*)l;
+        if (cd->hdr.code != NM_CUSTOMDRAW) break;
+        wchar_t cls[32];
+        GetClassNameW(cd->hdr.hwndFrom, cls, 32);
+        if (!_wcsicmp(cls, L"Button")) return drawButton(cd);
+        if (!_wcsicmp(cls, TRACKBAR_CLASSW)) return drawSlider(cd);
+        break;
+    }
+    case WM_PAINT: {  // section cards behind the controls
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        SelectObject(dc, GetStockObject(DC_BRUSH));
+        SelectObject(dc, GetStockObject(DC_PEN));
+        SelectObject(dc, uiBold);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, C_REDHOT);
+        for (auto& c : cards) {
+            box(dc, c.r, C_CARD, C_CARDLINE);
+            box(dc, {c.r.left, c.r.top, c.r.left + 3, c.r.top + 24}, C_RED, C_RED);
+            RECT t{c.r.left + 12, c.r.top + 5, c.r.right, c.r.top + 22};
+            DrawTextW(dc, c.title, -1, &t, DT_SINGLELINE | DT_NOPREFIX);
+        }
+        EndPaint(h, &ps);
+        return 0;
     }
     case TRAY_MSG:
         if (LOWORD(l) == NIN_BALLOONUSERCLICK && !lastClip.empty())
@@ -1572,20 +1728,29 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmd, int) {
     ncm.lfMessageFont.lfWeight = FW_BOLD;
     uiBold = CreateFontIndirectW(&ncm.lfMessageFont);
 
+    // undocumented uxtheme #135 SetPreferredAppMode(ForceDark): makes the tray menu dark; harmless if missing
+    if (auto setAppMode = (int(WINAPI*)(int))GetProcAddress(LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32), MAKEINTRESOURCEA(135)))
+        setAppMode(2);
+    brBg = CreateSolidBrush(C_BG);
+    brCard = CreateSolidBrush(C_CARD);
+    brCtrl = CreateSolidBrush(C_CTRL);
     WNDCLASSW wc{};
     wc.lpfnWndProc = wndProc;
     wc.hInstance = hi;
     wc.lpszClassName = L"Clipper";
-    wc.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
+    wc.hbrBackground = brBg;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
     RegisterClassW(&wc);
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     RECT r{0, 0, 492, 550};
     AdjustWindowRect(&r, style, FALSE);
     int ww = r.right - r.left, wh = r.bottom - r.top;
     ui = CreateWindowW(L"Clipper", L"Clipper " CLIPPER_VERSION_W, style, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2,
                        (GetSystemMetrics(SM_CYSCREEN) - wh) / 2, ww, wh, nullptr, nullptr, hi, nullptr);
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(ui, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    DwmSetWindowAttribute(ui, DWMWA_CAPTION_COLOR, &C_BG, sizeof(C_BG));  // Windows 11 only, ignored elsewhere
     buildUi();
 
     nid.hWnd = ui;
