@@ -1231,25 +1231,72 @@ static HBRUSH brBg, brCard, brCtrl;
 static const struct { RECT r; const wchar_t* title; } cards[] = {
     {{12, 76, 480, 182}, L"RECORDING"}, {{12, 190, 480, 320}, L"AUDIO"}, {{12, 328, 480, 544}, L"CLIPS"}};
 
+static void box(HDC dc, RECT r, COLORREF fill, COLORREF line) {
+    SetDCBrushColor(dc, fill);
+    SetDCPenColor(dc, line);
+    Rectangle(dc, r.left, r.top, r.right, r.bottom);
+}
+static void chevron(HDC dc, int x, int y, COLORREF c) {
+    HPEN p = CreatePen(PS_SOLID, 2, c);
+    HGDIOBJ old = SelectObject(dc, p);
+    POINT v[] = {{x - 4, y - 2}, {x, y + 2}, {x + 4, y - 2}};
+    Polyline(dc, v, 3);
+    SelectObject(dc, old);
+    DeleteObject(p);
+}
+
+// themed combo frames don't take our colours: paint the closed combo as a flat box with a chevron
+static LRESULT CALLBACK comboProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (m == WM_ERASEBKGND) return 1;
+    if (m != WM_PAINT) return DefSubclassProc(h, m, w, l);
+    COMBOBOXINFO ci{sizeof(ci)};
+    GetComboBoxInfo(h, &ci);
+    bool editable = (GetWindowLongW(h, GWL_STYLE) & 3) == CBS_DROPDOWN;
+    bool active = GetFocus() == h || (editable && GetFocus() == ci.hwndItem) || SendMessageW(h, CB_GETDROPPEDSTATE, 0, 0);
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT r;
+    GetClientRect(h, &r);
+    if (editable) {  // the edit child paints itself
+        RECT e;
+        GetWindowRect(ci.hwndItem, &e);
+        MapWindowPoints(nullptr, h, (POINT*)&e, 2);
+        ExcludeClipRect(dc, e.left, e.top, e.right, e.bottom);
+    }
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(DC_PEN));
+    box(dc, r, C_CTRL, active ? C_REDHOT : C_LINE);
+    if (!editable) {
+        wchar_t t[128] = L"";
+        LRESULT i = SendMessageW(h, CB_GETCURSEL, 0, 0);
+        if (i >= 0 && SendMessageW(h, CB_GETLBTEXTLEN, i, 0) < 128) SendMessageW(h, CB_GETLBTEXT, i, (LPARAM)t);
+        RECT tr{r.left + 6, r.top, ci.rcButton.left, r.bottom};
+        SelectObject(dc, uiFont);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, C_TEXT);
+        DrawTextW(dc, t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+    chevron(dc, (ci.rcButton.left + ci.rcButton.right) / 2, (r.top + r.bottom) / 2, active ? C_TEXT : C_MUTED);
+    EndPaint(h, &ps);
+    return 0;
+}
+
 static HWND ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id) {
     HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, ui, (HMENU)(INT_PTR)id,
                              GetModuleHandleW(nullptr), nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)uiFont, TRUE);
-    SetWindowTheme(c, wcscmp(cls, L"COMBOBOX") ? L"DarkMode_Explorer" : L"DarkMode_CFD", nullptr);
+    SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
     COMBOBOXINFO ci{sizeof(ci)};
-    if (GetComboBoxInfo(c, &ci)) SetWindowTheme(ci.hwndList, L"DarkMode_Explorer", nullptr);  // dark dropdown scrollbar
+    if (GetComboBoxInfo(c, &ci)) {
+        SetWindowTheme(ci.hwndList, L"DarkMode_Explorer", nullptr);  // dark dropdown scrollbar
+        SetWindowSubclass(c, comboProc, 0, 0);
+    }
     return c;
 }
 static bool onCard(HWND c) {
     int id = GetDlgCtrlID(c);
     return id != ID_STATUS && id != ID_SAVECLIP && id != ID_OPENFOLDER;
 }
-static void box(HDC dc, RECT r, COLORREF fill, COLORREF line) {
-    SetDCBrushColor(dc, fill);
-    SetDCPenColor(dc, line);
-    Rectangle(dc, r.left, r.top, r.right, r.bottom);
-}
-
 // buttons and checkboxes are painted here (NM_CUSTOMDRAW) so they keep their native behaviour
 static LRESULT drawButton(NMCUSTOMDRAW* cd) {
     if (cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
@@ -1361,7 +1408,7 @@ static void buildUi() {
     ctl(L"BUTTON", L"Open clips folder", WS_TABSTOP, 160, 38, 140, 28, ID_OPENFOLDER);
 
     ctl(L"STATIC", L"Game", 0, L, 104, 110, 20, 0);
-    ctl(L"COMBOBOX", L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP, X, 100, 250, 300, ID_GAME);
+    ctl(L"COMBOBOX", L"", CBS_DROPDOWN | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP, X, 100, 250, 300, ID_GAME);
     ctl(L"BUTTON", L"Refresh", WS_TABSTOP, X + 256, 99, 74, 25, ID_REFRESH);
     ctl(L"STATIC", L"Only records while this is running. Blank = always record.", 0, X, 127, W, 18, ID_HINT);
     ctl(L"STATIC", L"Save hotkey", 0, L, 152, 110, 20, 0);
@@ -1389,9 +1436,9 @@ static void buildUi() {
     SendMessageW(ud, UDM_SETRANGE32, 5, 300);
     ctl(L"STATIC", L"seconds", 0, X + 68, 354, 80, 20, 0);
     ctl(L"STATIC", L"Resolution", 0, L, 384, 110, 20, 0);
-    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, X, 381, 140, 200, ID_HEIGHT);
+    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X, 381, 140, 200, ID_HEIGHT);
     ctl(L"STATIC", L"FPS", 0, X + 160, 384, 30, 20, 0);
-    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, X + 195, 381, 70, 200, ID_FPS);
+    ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, X + 195, 381, 70, 200, ID_FPS);
     ctl(L"BUTTON", L"Crop ultrawide to 16:9 (centre)", BS_AUTOCHECKBOX | WS_TABSTOP, X, 410, W, 22, ID_CROP);
     ctl(L"STATIC", L"Max file size", 0, L, 442, 110, 20, 0);
     ctl(L"EDIT", L"", WS_BORDER | WS_TABSTOP, X, 439, 60, 23, ID_MAXMB);
@@ -1620,6 +1667,26 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (!_wcsicmp(cls, L"Button")) return drawButton(cd);
         if (!_wcsicmp(cls, TRACKBAR_CLASSW)) return drawSlider(cd);
         break;
+    }
+    case WM_MEASUREITEM:  // owner-drawn combos: closed field and list rows
+        ((MEASUREITEMSTRUCT*)l)->itemHeight = ((MEASUREITEMSTRUCT*)l)->itemID == (UINT)-1 ? 18 : 22;
+        return TRUE;
+    case WM_DRAWITEM: {  // owner-drawn combo list rows
+        auto* di = (DRAWITEMSTRUCT*)l;
+        HDC dc = di->hDC;
+        SelectObject(dc, GetStockObject(DC_BRUSH));
+        SetBkMode(dc, TRANSPARENT);
+        SetDCBrushColor(dc, di->itemState & ODS_SELECTED ? C_RED : C_CTRL);
+        FillRect(dc, &di->rcItem, (HBRUSH)GetStockObject(DC_BRUSH));
+        wchar_t t[MAX_PATH] = L"";
+        if ((int)di->itemID >= 0 && SendMessageW(di->hwndItem, CB_GETLBTEXTLEN, di->itemID, 0) < MAX_PATH)
+            SendMessageW(di->hwndItem, CB_GETLBTEXT, di->itemID, (LPARAM)t);
+        RECT r = di->rcItem;
+        r.left += 6;
+        SelectObject(dc, uiFont);
+        SetTextColor(dc, C_TEXT);
+        DrawTextW(dc, t, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        return TRUE;
     }
     case WM_PAINT: {  // section cards behind the controls
         PAINTSTRUCT ps;
