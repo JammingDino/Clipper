@@ -133,6 +133,7 @@ static const char kDefaultIni[] =
     "seconds=30\r\n"
     "; Output height: 0 = auto (best resolution for the size cap), or e.g. 1080 / 720 / 540\r\n"
     "height=0\r\n"
+    "; Max frame rate. Only frames the screen actually shows are recorded (a game at 40 fps records 40 fps).\r\n"
     "fps=60\r\n"
     "; 1 = crop ultrawide monitors to the centre 16:9\r\n"
     "crop=0\r\n"
@@ -313,6 +314,7 @@ static void storeSample(IMFSample* s, std::deque<Packet>& q) {
     p.data.assign(d, d + n);
     b->Unlock();
     std::lock_guard<std::mutex> l(bufMx);
+    if (&q == &vBuf && !q.empty() && p.t > q.back().t) q.back().dur = p.t - q.back().t;
     q.push_back(std::move(p));
     LONGLONG keep = (cfg.seconds + 5) * 10000000LL;
     while (q.size() > 1 && q.back().t - q.front().t > keep) q.pop_front();
@@ -506,7 +508,7 @@ static bool videoLoop(HMONITOR mon, HWND win) {
         v.ulVal = (ULONG)std::min<UINT64>(2ull * vbr, 200000000);
         if (isVbr) api->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &v);
         logf(L"buffer rate control: %ls", isVbr ? L"peak-constrained VBR" : L"CBR (VBR not supported)");
-        v.ulVal = fps;  // keyframe every second = clip start granularity
+        v.ulVal = fps * 2;  // backstop only: keyframes are forced every second of real time (clip start granularity)
         api->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
     }
     auto videoType = [&](const GUID& sub) {
@@ -617,7 +619,8 @@ static bool videoLoop(HMONITOR mon, HWND win) {
     const LONGLONG frameHns = 10000000 / fps;
     LONGLONG next = nowHns();
     int credits = 0, cur = 0;
-    bool haveFrame = false;
+    bool haveFrame = false, fresh = false;  // fresh: the frame waiting to be sent is a new screen image
+    LONGLONG lastSent = LLONG_MIN / 2, lastKey = LLONG_MIN / 2;
     while (running) {
         next += frameHns;
         LONGLONG wait = next - nowHns();
@@ -639,7 +642,9 @@ static bool videoLoop(HMONITOR mon, HWND win) {
             break;
         }
 
-        // grab the newest desktop image if it changed; otherwise re-send the last converted frame (constant fps)
+        // Variable frame rate: encode only new desktop images, so a game at 5 fps records 5 fps and costs
+        // 5 fps worth of bits. While the screen is frozen, re-send the last frame once a second (keeps keyframes
+        // and the clip start fresh).
         HRESULT hr = DXGI_ERROR_ACCESS_LOST;
         if (!dup) duplicate();  // lost on mode switch / HDR toggle / UAC; retry each tick
         if (dup) {
@@ -680,7 +685,7 @@ static bool videoLoop(HMONITOR mon, HWND win) {
                     vs.pInputSurface = inView.Get();
                     vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &cap);
                     vctx->VideoProcessorBlt(vp.Get(), outView[cur].Get(), 0, 1, &vs);
-                    haveFrame = true;
+                    haveFrame = fresh = true;
                 }
                 dup->ReleaseFrame();
             } else if (hr != DXGI_ERROR_WAIT_TIMEOUT) {
@@ -696,7 +701,8 @@ static bool videoLoop(HMONITOR mon, HWND win) {
             else if (t == METransformHaveOutput) drainOutput();
             ev.Reset();
         }
-        if (credits > 0 && haveFrame) {
+        bool due = haveFrame && (fresh || next - lastSent >= 10000000);
+        if (due && credits > 0) {
             ComPtr<IMFSample> s;
             ComPtr<IMFMediaBuffer> b;
             MFCreateSample(&s);
@@ -707,11 +713,21 @@ static bool videoLoop(HMONITOR mon, HWND win) {
                 b->SetCurrentLength(len);
                 s->AddBuffer(b.Get());
                 s->SetSampleTime(next);
-                s->SetSampleDuration(frameHns);
-                if (SUCCEEDED(enc->ProcessInput(0, s.Get(), 0))) credits--;
-                else droppedFrames++;
+                s->SetSampleDuration(frameHns);  // provisional; storeSample stretches it to the next frame
+                VARIANT k;
+                k.vt = VT_UI4;
+                k.ulVal = 1;
+                bool key = next - lastKey >= 10000000 && api && SUCCEEDED(api->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &k));
+                if (SUCCEEDED(enc->ProcessInput(0, s.Get(), 0))) {
+                    credits--;
+                    fresh = false;
+                    lastSent = next;
+                    if (key) lastKey = next;
+                } else {
+                    droppedFrames++;
+                }
             }
-        } else if (haveFrame) {
+        } else if (due) {
             droppedFrames++;  // encoder still busy with earlier frames
         }
     }
@@ -1087,8 +1103,8 @@ static void compressAndSave(std::vector<Packet> v, size_t s, std::vector<Packet>
         MFGetAttributeSize(vt.Get(), MF_MT_FRAME_SIZE, &bufW, &bufH);
         double secs = (v.back().t + v.back().dur - v[s].t) / 1e7;
         size = fileSize(src);
-        logf(L"saving %.1fs clip, buffer %ux%u %.1f MB, %d frames dropped since the last save", secs, bufW, bufH, size / 1e6,
-             droppedFrames.exchange(0));
+        logf(L"saving %.1fs clip (%.1f fps avg), buffer %ux%u %.1f MB, %d frames dropped since the last save", secs,
+             (v.size() - s) / secs, bufW, bufH, size / 1e6, droppedFrames.exchange(0));
         bool fits = size <= limit;
         size = 0;
         if (keepIfFits && fits) {  // fixed bitrate and under the cap: the buffer is the clip
