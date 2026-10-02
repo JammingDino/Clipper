@@ -974,17 +974,22 @@ static bool writeMp4(const std::wstring& path, const std::vector<Packet>& v, siz
 }
 
 // ---------- smart compression ----------
-// The buffer is recorded at 2x the cap's bitrate. On save the clip is always re-encoded with VBR (calm moments get
-// few bits, fights get many), and the bitrate is walked until the file lands just under the cap. Resolution is
-// picked from the bitrate: fewer clean pixels beat many blocky ones.
+// The buffer is recorded at 2x the cap's bitrate. On save the clip is re-encoded at constant quality: every frame
+// looks equally good, so fights and high-fps stretches take the bits while calm or low-fps stretches cost little.
+// The quality is searched until the file lands just under the cap. Resolution is picked from the average bitrate:
+// fewer clean pixels beat many blocky ones.
 static ULONGLONG fileSize(const std::wstring& p) {
     WIN32_FILE_ATTRIBUTE_DATA fa;
     if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fa)) return 0;
     return ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
 }
 
-static bool transcode(const std::wstring& src, const std::wstring& dst, UINT w, UINT h, UINT32 bitrate,
-                      IMFDXGIDeviceManager* mgr) {
+// The buffer is variable frame rate; the saved clip is constant `fps` (the reader's video processor repeats frames).
+// At constant quality a repeat has nothing left to refine and codes as a near-free skip, so low-fps stretches still
+// cost almost nothing while the file stays a plain CFR MP4 every player and editor handles.
+// quality 1-100 = constant quality; 0 = VBR at `bitrate` (fallback for encoders without a quality mode).
+static bool transcode(const std::wstring& src, const std::wstring& dst, UINT w, UINT h, UINT fps, UINT32 bitrate,
+                      UINT32 quality, IMFDXGIDeviceManager* mgr) {
     ComPtr<IMFAttributes> ra, wa, encAttrs;
     MFCreateAttributes(&ra, 3);
     ra->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, mgr);
@@ -994,12 +999,12 @@ static bool transcode(const std::wstring& src, const std::wstring& dst, UINT w, 
     CHECK(MFCreateSourceReaderFromURL(src.c_str(), ra.Get(), &r));
     ComPtr<IMFMediaType> native, raw, cur, audio, out;
     CHECK(r->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &native));
-    UINT32 fn = 60, fd = 1;
-    MFGetAttributeRatio(native.Get(), MF_MT_FRAME_RATE, &fn, &fd);
+    const UINT32 fn = fps, fd = 1;
     MFCreateMediaType(&raw);
     raw->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     raw->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     MFSetAttributeSize(raw.Get(), MF_MT_FRAME_SIZE, w, h);
+    MFSetAttributeRatio(raw.Get(), MF_MT_FRAME_RATE, fn, fd);
     CHECK(r->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, raw.Get()));
     CHECK(r->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur));
     bool withAudio = SUCCEEDED(r->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &audio)) &&
@@ -1029,8 +1034,13 @@ static bool transcode(const std::wstring& src, const std::wstring& dst, UINT w, 
     DWORD vs, as = 0;
     CHECK(wr->AddStream(out.Get(), &vs));
     MFCreateAttributes(&encAttrs, 5);
-    encAttrs->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_UnconstrainedVBR);
-    encAttrs->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, bitrate);
+    if (quality) {
+        encAttrs->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_Quality);
+        encAttrs->SetUINT32(CODECAPI_AVEncCommonQuality, quality);
+    } else {
+        encAttrs->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_UnconstrainedVBR);
+        encAttrs->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, bitrate);
+    }
     encAttrs->SetUINT32(CODECAPI_AVEncMPVDefaultBPictureCount, 2);
     // sparse keyframes (CamStudio-style): full frames are the expensive ones; a short clip barely needs seek points
     encAttrs->SetUINT32(CODECAPI_AVEncMPVGOPSize, 10 * fn / std::max(fd, 1u));
@@ -1056,11 +1066,11 @@ static bool transcode(const std::wstring& src, const std::wstring& dst, UINT w, 
 
 // Work back from the cap: aim for 98.5% of it and rescale the bitrate by each miss (size ~ bitrate), up or down.
 // Keeps the largest encode that fits; stops once within 3% of the cap. Returns the size written to dst, 0 if none fit.
-static ULONGLONG fitToSize(const std::wstring& src, const std::wstring& tmp, const std::wstring& dst, UINT w, UINT h,
+static ULONGLONG fitBitrate(const std::wstring& src, const std::wstring& tmp, const std::wstring& dst, UINT w, UINT h, UINT fps,
                            ULONGLONG limit, UINT32 bitrate, IMFDXGIDeviceManager* mgr) {
     ULONGLONG best = 0;
     for (int pass = 0; pass < 5 && best < limit * 0.97; pass++) {
-        if (!transcode(src, tmp, w, h, bitrate, mgr)) break;
+        if (!transcode(src, tmp, w, h, fps, bitrate, 0, mgr)) break;
         ULONGLONG size = fileSize(tmp);
         logf(L"  pass %d: %ux%u %u kbps -> %.2f MB", pass + 1, w, h, bitrate / 1000, size / 1e6);
         if (!size) break;
@@ -1068,6 +1078,39 @@ static ULONGLONG fitToSize(const std::wstring& src, const std::wstring& tmp, con
         bitrate = (UINT32)std::clamp(bitrate * (limit * 0.985 / size), 1e5, 250e6);
     }
     return best;
+}
+
+// Constant-quality search: size grows with quality, so bracket the cap and interpolate on log(size). Starts from the
+// last save's quality (clips from the same game land close). Keeps the largest encode that fits; stops within 3% of
+// the cap, at quality 100, or when the bracket closes. Falls back to the bitrate walk if quality mode isn't available.
+static ULONGLONG fitToSize(const std::wstring& src, const std::wstring& tmp, const std::wstring& dst, UINT w, UINT h, UINT fps,
+                           ULONGLONG limit, UINT32 bitrate, IMFDXGIDeviceManager* mgr) {
+    static int lastQ = 70;
+    int lo = 0, hi = 101, q = lastQ;  // lo fits (or 0 = none yet), hi is too big (101 = none yet)
+    double loSize = 0, hiSize = 0;
+    ULONGLONG best = 0;
+    for (int pass = 0; pass < 6; pass++) {
+        if (!transcode(src, tmp, w, h, fps, 0, q, mgr)) break;
+        ULONGLONG size = fileSize(tmp);
+        logf(L"  pass %d: %ux%u quality %d -> %.2f MB", pass + 1, w, h, q, size / 1e6);
+        if (!size) break;
+        if (size <= limit) {
+            if (size > best && MoveFileExW(tmp.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING)) best = size, lastQ = q;
+            lo = q, loSize = (double)size;
+        } else {
+            hi = q, hiSize = (double)size;
+        }
+        if (best >= limit * 0.97 || lo == 100 || hi - lo <= 1) break;
+        if (lo && hi <= 100) {
+            double f = (std::log(limit * 0.985) - std::log(loSize)) / (std::log(hiSize) - std::log(loSize));
+            q = std::clamp(lo + (int)std::lround((hi - lo) * f), lo + 1, hi - 1);
+        } else {
+            q = lo ? std::min(100, lo + 15) : std::max(1, hi - 25);
+        }
+    }
+    if (best) return best;
+    logf(L"  quality search found no fit, falling back to bitrate");
+    return fitBitrate(src, tmp, dst, w, h, fps, limit, bitrate, mgr);
 }
 
 static NOTIFYICONDATAW nid{sizeof(nid)};
@@ -1123,7 +1166,9 @@ static void compressAndSave(std::vector<Packet> v, size_t s, std::vector<Packet>
             ComPtr<ID3D11Multithread> mt;
             if (SUCCEEDED(dev.As(&mt))) mt->SetMultithreadProtected(TRUE);
             UINT outW = (UINT)((UINT64)outH * bufW / bufH + 1) & ~1u;
-            size = fitToSize(src, tmp, path, outW, outH, limit, budget, mgr.Get());
+            UINT32 fn = 60, fd = 1;  // capture rate, from the buffer encoder's type
+            MFGetAttributeRatio(vt.Get(), MF_MT_FRAME_RATE, &fn, &fd);
+            size = fitToSize(src, tmp, path, outW, outH, fn / std::max(fd, 1u), limit, budget, mgr.Get());
         }
         // re-encode failed but the buffer itself fits: better an under-cap clip than none
         if (!size && fits && MoveFileExW(src.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))

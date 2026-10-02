@@ -2,7 +2,7 @@
 
 Tiny replay-buffer game clipper for Windows. Press a hotkey and the last N seconds are saved as an MP4 under a file size cap (default 19 MB, so it fits Discord's upload limit).
 
-- **Video:** Desktop Duplication → GPU scale/convert (D3D11 video processor) → hardware H.264 (Media Foundation). HDR displays are tone-mapped. Variable frame rate: only frames the screen actually shows are recorded, so a game dipping to 5 fps records 5 fps instead of repeats.
+- **Video:** Desktop Duplication → GPU scale/convert (D3D11 video processor) → hardware H.264 (Media Foundation). HDR displays are tone-mapped. Only frames the screen actually shows are recorded (variable frame rate), and auto-sized clips are saved at constant quality: a stretch where the game dips to 5 fps costs almost nothing, so the bits go to the busy parts.
 - **Audio:** WASAPI game-only process loopback, Discord, mic, or full desktop → mixer → AAC.
 - Encoded packets sit in RAM; saving is a remux, recompressed only if needed to land under the size cap.
 - Records only while the configured game is running, on the monitor it's on.
