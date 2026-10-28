@@ -88,11 +88,14 @@ bool videoLoop(HMONITOR mon, HWND win) {
     ComPtr<IDXGIDevice> dxdev;
     HRESULT gpuPrio = SUCCEEDED(dev.As(&dxdev)) ? dxdev->SetGPUThreadPriority(7) : E_FAIL;
     auto setGpuClass = (LONG(WINAPI*)(HANDLE, int))GetProcAddress(GetModuleHandleW(L"gdi32.dll"), "D3DKMTSetProcessSchedulingPriorityClass");
-    LONG gpuClass = setGpuClass ? setGpuClass(GetCurrentProcess(), 4 /* D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH */) : -1;
+    // REALTIME (needs admin) is what keeps display capture smooth under a GPU-bound game; HIGH otherwise
+    const wchar_t* gpuClassName = L"failed";
+    if (setGpuClass && !setGpuClass(GetCurrentProcess(), 5 /* REALTIME */)) gpuClassName = L"realtime";
+    else if (setGpuClass && !setGpuClass(GetCurrentProcess(), 4 /* HIGH */)) gpuClassName = L"high (run as admin for realtime)";
     DWORD task = 0;
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Capture", &task);
     logf(L"priority: gpu thread %ls, gpu class %ls, mmcss %ls", SUCCEEDED(gpuPrio) ? L"ok" : L"failed",
-         gpuClass == 0 ? L"high" : L"failed", mmcss ? L"ok" : L"failed");
+         gpuClassName, mmcss ? L"ok" : L"failed");
     ComPtr<ID3D11VideoDevice> vdev;
     ComPtr<ID3D11VideoContext> vctx;
     CHECK(dev.As(&vdev));
@@ -235,6 +238,7 @@ bool videoLoop(HMONITOR mon, HWND win) {
     ComPtr<ID3D11VideoProcessorInputView> inView;
     auto buildInput = [&](D3D11_TEXTURE2D_DESC td) -> bool {  // on first frame and whenever the game changes resolution
         frameFmt = td.Format;
+        td.Width = srcW, td.Height = srcH;  // only the game's area is copied and tone-mapped, not the whole desktop
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         td.CPUAccessFlags = td.MiscFlags = 0;
@@ -301,6 +305,8 @@ bool videoLoop(HMONITOR mon, HWND win) {
     int credits = 0, cur = 0;
     bool haveFrame = false, fresh = false;  // fresh: the frame waiting to be sent is a new screen image
     LONGLONG lastSent = LLONG_MIN / 2, lastKey = LLONG_MIN / 2;
+    // per-10s stats: where the frames go when capture can't keep up
+    struct { LONGLONG t0; int ticks, fresh, sent, busy, late; LONGLONG acq, blt, in; } st{nowHns()};
     while (running) {
         next += frameHns;
         LONGLONG wait = next - nowHns();
@@ -311,6 +317,7 @@ bool videoLoop(HMONITOR mon, HWND win) {
             WaitForSingleObject(timer, INFINITE);
         } else if (wait < -4 * frameHns) {
             droppedFrames += (int)(-wait / frameHns);
+            st.late += (int)(-wait / frameHns);
             next = nowHns();  // fell behind (e.g. system stall): skip ahead instead of bursting
         }
         captureRect(win, monRc, cap);  // follow the window as it moves
@@ -325,25 +332,27 @@ bool videoLoop(HMONITOR mon, HWND win) {
         // Variable frame rate: encode only new desktop images, so a game at 5 fps records 5 fps and costs
         // 5 fps worth of bits. While the screen is frozen, re-send the last frame once a second (keeps keyframes
         // and the clip start fresh).
+        st.ticks++;
         HRESULT hr = DXGI_ERROR_ACCESS_LOST;
         if (!dup) duplicate();  // lost on mode switch / HDR toggle / UAC; retry each tick
         if (dup) {
             DXGI_OUTDUPL_FRAME_INFO fi;
             ComPtr<IDXGIResource> res;
+            LONGLONG ta = nowHns();
             hr = dup->AcquireNextFrame(0, &fi, &res);
+            st.acq = std::max(st.acq, nowHns() - ta);
             if (SUCCEEDED(hr)) {
                 ComPtr<ID3D11Texture2D> tex;
                 if (fi.LastPresentTime.QuadPart && SUCCEEDED(res.As(&tex))) {
                     D3D11_TEXTURE2D_DESC td;
                     tex->GetDesc(&td);
-                    D3D11_TEXTURE2D_DESC cd{};
-                    if (srcTex) srcTex->GetDesc(&cd);
-                    if (!srcTex || cd.Width != td.Width || cd.Height != td.Height || frameFmt != td.Format) {
+                    if (!srcTex || frameFmt != td.Format) {
                         if (!buildInput(td)) { dup->ReleaseFrame(); return false; }
                     }
+                    D3D11_BOX box{(UINT)cap.left, (UINT)cap.top, 0, (UINT)cap.right, (UINT)cap.bottom, 1};
                     if (hdrTex) {
-                        ctx->CopyResource(hdrTex.Get(), tex.Get());
-                        D3D11_VIEWPORT vpt{0, 0, (float)td.Width, (float)td.Height, 0, 1};
+                        ctx->CopySubresourceRegion(hdrTex.Get(), 0, 0, 0, 0, tex.Get(), 0, &box);
+                        D3D11_VIEWPORT vpt{0, 0, (float)srcW, (float)srcH, 0, 1};
                         ctx->OMSetRenderTargets(1, srcRtv.GetAddressOf(), nullptr);
                         ctx->RSSetViewports(1, &vpt);
                         ctx->IASetInputLayout(nullptr);
@@ -357,17 +366,18 @@ bool videoLoop(HMONITOR mon, HWND win) {
                         ctx->PSSetShaderResources(0, 1, &none);
                         ctx->OMSetRenderTargets(0, nullptr, nullptr);
                     } else {
-                        ctx->CopyResource(srcTex.Get(), tex.Get());
+                        ctx->CopySubresourceRegion(srcTex.Get(), 0, 0, 0, 0, tex.Get(), 0, &box);
                     }
                     cur = (cur + 1) % POOL;
                     D3D11_VIDEO_PROCESSOR_STREAM vs{};
                     vs.Enable = TRUE;
                     vs.pInputSurface = inView.Get();
-                    vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &cap);
                     vctx->VideoProcessorBlt(vp.Get(), outView[cur].Get(), 0, 1, &vs);
                     haveFrame = fresh = true;
+                    st.fresh++;
                 }
                 dup->ReleaseFrame();
+                st.blt = std::max(st.blt, nowHns() - ta);
             } else if (hr != DXGI_ERROR_WAIT_TIMEOUT) {
                 dup.Reset();
             }
@@ -398,8 +408,12 @@ bool videoLoop(HMONITOR mon, HWND win) {
                 k.vt = VT_UI4;
                 k.ulVal = 1;
                 bool key = next - lastKey >= 10000000 && api && SUCCEEDED(api->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &k));
-                if (SUCCEEDED(enc->ProcessInput(0, s.Get(), 0))) {
+                LONGLONG ti = nowHns();
+                HRESULT ihr = enc->ProcessInput(0, s.Get(), 0);
+                st.in = std::max(st.in, nowHns() - ti);
+                if (SUCCEEDED(ihr)) {
                     credits--;
+                    st.sent++;
                     fresh = false;
                     lastSent = next;
                     if (key) lastKey = next;
@@ -409,6 +423,15 @@ bool videoLoop(HMONITOR mon, HWND win) {
             }
         } else if (due) {
             droppedFrames++;  // encoder still busy with earlier frames
+            st.busy++;
+        }
+        if (nowHns() - st.t0 >= 100000000) {
+            double secs = (nowHns() - st.t0) / 1e7;
+            logf(L"capture: %.0f ticks/s, %.0f new images/s, %.0f encoded/s, %.0f/s encoder busy, %.0f/s late ticks; "
+                 L"worst ms: acquire %.1f, acquire+copy %.1f, encode submit %.1f",
+                 st.ticks / secs, st.fresh / secs, st.sent / secs, st.busy / secs, st.late / secs, st.acq / 1e4,
+                 st.blt / 1e4, st.in / 1e4);
+            st = {nowHns()};
         }
     }
     CloseHandle(timer);
