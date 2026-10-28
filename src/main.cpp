@@ -49,6 +49,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmd, int) {
     QueryPerformanceFrequency(&f);
     qpcFreq = f.QuadPart;
     loadConfig();
+    logf(L"Clipper %ls started", CLIPPER_VERSION_W);
 
     createUi(hi, !wcsstr(cmd, L"--tray"));
 

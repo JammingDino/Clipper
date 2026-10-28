@@ -63,7 +63,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-// Set by the release build (build.bat passes VERSION from the git tag); local builds show "dev".
+// Set by build.bat: the release tag, or dev-<commit>[-dirty] for local builds; "dev" if built without it.
 #ifndef CLIPPER_VERSION
 #define CLIPPER_VERSION dev
 #endif
